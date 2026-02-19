@@ -33,6 +33,10 @@ enum Commands {
         #[command(subcommand)]
         command: DoctorCommands,
     },
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,6 +106,28 @@ enum DoctorCommands {
         gateway_mounts: Option<PathBuf>,
         #[arg(long)]
         gateway_views: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommands {
+    Explain {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        request: String,
+    },
+    Lint {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Compile {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -333,6 +359,36 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 } else {
                     Err(anyhow::anyhow!("doctor found issues"))
                 }
+            }
+        },
+        Commands::Policy { command } => match command {
+            PolicyCommands::Explain { policy, request } => {
+                let out = toolfw_core::policy_explain(&policy, &request)?;
+                println!("{}", serde_json::to_string(&out)?);
+                Ok(())
+            }
+            PolicyCommands::Lint { policy, json } => {
+                let out = toolfw_core::policy_lint(&policy)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                } else {
+                    println!("{}", serde_json::to_string(&out)?);
+                }
+                let ok = out.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                if ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("policy lint errors"))
+                }
+            }
+            PolicyCommands::Compile { policy, json } => {
+                let out = toolfw_core::policy_compile(&policy)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                } else {
+                    println!("{}", serde_json::to_string(&out)?);
+                }
+                Ok(())
             }
         },
     }

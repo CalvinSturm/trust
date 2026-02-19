@@ -11,6 +11,7 @@ This MVP is intended to mitigate:
 - unauthorized tool use when capability-token enforcement is enabled at the gateway
 - stronger request attribution via token-derived client identity in toolfw audit metadata
 - reduced blast radius from key compromise via keyring-based key rotation and revocation
+- abusive request bursts via per-client tool rate limits in toolfw policy (when configured)
 
 This MVP does not mitigate:
 - a compromised host operating system
@@ -19,6 +20,7 @@ This MVP does not mitigate:
 - full data loss prevention (DLP)
 - token exfiltration from compromised clients or hosts
 - immediate invalidation of already-issued stolen tokens signed by still-active keys
+- durable/global rate limiting (current limiter is in-memory per proxy process)
 
 ## Privacy defaults
 

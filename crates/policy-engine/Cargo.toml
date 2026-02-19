@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 globset.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 serde_json.workspace = true

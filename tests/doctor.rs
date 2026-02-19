@@ -173,3 +173,83 @@ fn doctor_proxy_stdio_fails_on_missing_audit_dependency_and_invalid_yaml() {
         .iter()
         .any(|i| i.as_str().unwrap().contains("invalid policy yaml")));
 }
+
+#[test]
+fn doctor_reports_policy_lint_errors_as_issues() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let policy = root.join("policy.yaml");
+    fs::write(
+        &policy,
+        r#"
+protocol_version: "2025-06-18"
+defaults: { decision: deny }
+rules:
+  - id: bad
+    match:
+      tool: "files.search"
+      args:
+        query:
+          regex: "["
+    decision: allow
+"#,
+    )
+    .unwrap();
+
+    let output = toolfw_cmd()
+        .args([
+            "doctor",
+            "proxy-stdio",
+            "--policy",
+            policy.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["ok"], false);
+    assert!(report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i.as_str().unwrap().contains("policy lint error")));
+}
+
+#[test]
+fn doctor_reports_policy_lint_warnings() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let policy = root.join("policy.yaml");
+    fs::write(
+        &policy,
+        r#"
+protocol_version: "2025-06-18"
+defaults: { decision: deny }
+rules:
+  - match:
+      tool: "views.query"
+      args:
+        view: "notes_recent"
+    decision: deny
+"#,
+    )
+    .unwrap();
+
+    let output = toolfw_cmd()
+        .args([
+            "doctor",
+            "proxy-stdio",
+            "--policy",
+            policy.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["ok"], true);
+    assert!(report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("policy lint warning")));
+}

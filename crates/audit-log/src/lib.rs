@@ -33,6 +33,10 @@ pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_reasons: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub args_digest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args_bytes: Option<usize>,
@@ -67,6 +71,8 @@ impl AuditEvent {
             method: None,
             tool: None,
             decision: None,
+            rule_id: None,
+            policy_reasons: None,
             args_digest: None,
             args_bytes: None,
             result_digest: None,

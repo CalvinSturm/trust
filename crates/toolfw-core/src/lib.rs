@@ -3,6 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -25,7 +26,10 @@ use cap_token::{
 use hmac::{Hmac, Mac};
 use jsonschema::JSONSchema;
 use mcp_wire::{error, read_json_line_streaming, Id};
-use policy_engine::{evaluate_with_context, parse_policy, Decision, Policy, RequestContext};
+use policy_engine::{
+    compile_and_lint, evaluate_with_context, lint_policy, parse_policy, request_from_params,
+    CompiledPolicy, Decision, RequestContext,
+};
 use rand::{distributions::Alphanumeric, Rng};
 use redaction::Redactor;
 use serde::{Deserialize, Serialize};
@@ -36,6 +40,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const TOOLFW_DENIED: i64 = -32040;
 pub const TOOLFW_APPROVAL_REQUIRED: i64 = -32041;
+pub const TOOLFW_RATE_LIMITED: i64 = -32042;
 const RESERVED_ARG_NS: &str = "__toolfw";
 const INVALID_PARAMS: i64 = -32602;
 const MAX_VALIDATION_ERRORS: usize = 5;
@@ -149,6 +154,8 @@ pub struct DoctorReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorSummary {
     pub policy_rules: usize,
+    pub policy_lint_errors: usize,
+    pub policy_lint_warnings: usize,
     pub auth: String,
     pub audit: String,
 }
@@ -186,10 +193,93 @@ pub fn audit_verify(audit_path: &Path, checkpoint_path: &Path, pubkey_path: &Pat
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ExplainRequestInput {
+    client_id: Option<String>,
+    auth_verified: Option<bool>,
+    token_key_id: Option<String>,
+    mcp_method: String,
+    tool: Option<String>,
+    #[serde(default)]
+    args: Value,
+}
+
+pub fn policy_explain(policy_path: &Path, request_json: &str) -> Result<Value> {
+    let txt = fs::read_to_string(policy_path)
+        .with_context(|| format!("read policy file {}", policy_path.display()))?;
+    let policy = parse_policy(&txt)?;
+    let req: ExplainRequestInput =
+        serde_json::from_str(request_json).context("parse explain request json")?;
+    let auth_verified = req.auth_verified.unwrap_or(false);
+    let eval = evaluate_with_context(
+        &policy,
+        &policy_engine::PolicyRequest {
+            mcp_method: req.mcp_method,
+            tool: req.tool,
+            args: req.args,
+        },
+        &RequestContext {
+            client_id: if auth_verified { req.client_id } else { None },
+            auth_verified: Some(auth_verified),
+            token_key_id: if auth_verified {
+                req.token_key_id
+            } else {
+                None
+            },
+        },
+    );
+
+    Ok(json!({
+        "decision": eval.decision,
+        "rule_id": eval.matched_rule_id,
+        "rule_index": eval.matched_rule_index,
+        "reasons": eval.reasons.into_iter().take(5).map(|r| r.message).collect::<Vec<_>>(),
+        "matched": eval.matched,
+    }))
+}
+
+pub fn policy_lint(policy_path: &Path) -> Result<Value> {
+    let txt = fs::read_to_string(policy_path)
+        .with_context(|| format!("read policy file {}", policy_path.display()))?;
+    let policy = parse_policy(&txt)?;
+    serde_json::to_value(lint_policy(&policy)).context("serialize lint report")
+}
+
+pub fn policy_compile(policy_path: &Path) -> Result<Value> {
+    let txt = fs::read_to_string(policy_path)
+        .with_context(|| format!("read policy file {}", policy_path.display()))?;
+    let policy = parse_policy(&txt)?;
+    let _ = policy.compile()?;
+    let rules = policy
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(idx, r)| {
+            json!({
+                "id": r.id,
+                "index": idx,
+                "priority": r.priority.unwrap_or(0),
+                "hard": r.hard,
+                "decision": r.decision,
+                "has_not": r.matcher.not.is_some(),
+                "has_args": r.matcher.args.as_ref().map(|a| !a.is_empty()).unwrap_or(false),
+                "limit_per_client": r.limit.as_ref().and_then(|l| l.per_client.as_ref()).map(|p| json!({"capacity": p.capacity, "refill_per_sec": p.refill_per_sec})),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "compiled": true,
+        "rule_count": rules.len(),
+        "rules": rules,
+    }))
+}
+
 pub fn doctor_proxy_stdio(opts: &DoctorProxyStdioOptions<'_>) -> Result<DoctorReport> {
     let mut issues = Vec::new();
     let mut warnings = Vec::new();
     let mut policy_rules = 0usize;
+    let mut lint_errors = 0usize;
+    let mut lint_warnings = 0usize;
 
     if opts.auth_pubkey.is_some() && opts.auth_keys.is_some() {
         issues.push("--auth-pubkey and --auth-keys are mutually exclusive".to_string());
@@ -204,7 +294,18 @@ pub fn doctor_proxy_stdio(opts: &DoctorProxyStdioOptions<'_>) -> Result<DoctorRe
 
     match fs::read_to_string(opts.policy) {
         Ok(txt) => match parse_policy(&txt) {
-            Ok(policy) => policy_rules = policy.rules.len(),
+            Ok(policy) => {
+                policy_rules = policy.rules.len();
+                let lint = lint_policy(&policy);
+                lint_errors = lint.summary.error_count;
+                lint_warnings = lint.summary.warning_count;
+                for d in lint.errors.into_iter().take(20) {
+                    issues.push(format!("policy lint error {}: {}", d.code, d.message));
+                }
+                for d in lint.warnings.into_iter().take(20) {
+                    warnings.push(format!("policy lint warning {}: {}", d.code, d.message));
+                }
+            }
             Err(e) => issues.push(format!("invalid policy yaml: {e}")),
         },
         Err(e) => issues.push(format!("policy file unreadable: {e}")),
@@ -281,6 +382,8 @@ pub fn doctor_proxy_stdio(opts: &DoctorProxyStdioOptions<'_>) -> Result<DoctorRe
         warnings,
         summary: DoctorSummary {
             policy_rules,
+            policy_lint_errors: lint_errors,
+            policy_lint_warnings: lint_warnings,
             auth,
             audit,
         },
@@ -536,10 +639,20 @@ pub fn run_proxy_stdio(
         bail!("--auth-pubkey and --auth-keys are mutually exclusive");
     }
 
-    let policy = {
+    let compiled_policy = {
         let txt = fs::read_to_string(policy_path)
             .with_context(|| format!("read policy file {}", policy_path.display()))?;
-        parse_policy(&txt)?
+        let policy = parse_policy(&txt)?;
+        let (compiled, lint) = compile_and_lint(&policy)?;
+        if !lint.ok {
+            let first = lint
+                .errors
+                .first()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .unwrap_or_else(|| "unknown policy lint error".to_string());
+            bail!("policy lint errors present: {first}");
+        }
+        compiled
     };
 
     let config = ProxyConfig {
@@ -593,15 +706,17 @@ pub fn run_proxy_stdio(
     let mut client_partial = Vec::new();
     let mut upstream_partial = Vec::new();
     let mut schema_cache: HashMap<String, Value> = HashMap::new();
+    let rate_limiter = RateLimiter::default();
 
     while let Some(client_msg) = read_json_line_streaming(&mut stdin, &mut client_partial)? {
         if let Some(resp) = process_client_message(
-            &policy,
+            &compiled_policy,
             approval_store_path,
             &mut child_in,
             &mut child_out,
             &mut upstream_partial,
             &mut schema_cache,
+            &rate_limiter,
             audit.as_ref(),
             audit_checkpoint_path,
             &config,
@@ -632,6 +747,9 @@ struct EvalMeta {
     auth_verified: Option<bool>,
     token_key_id: Option<String>,
     token_digest: Option<String>,
+    rule_id: Option<String>,
+    rule_index: Option<usize>,
+    policy_reasons: Option<Vec<String>>,
 }
 
 struct EvalOutcome {
@@ -647,6 +765,17 @@ struct AuthInfo {
     token_digest: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct RateLimiter {
+    buckets: Mutex<HashMap<String, BucketState>>,
+}
+
+#[derive(Debug, Clone)]
+struct BucketState {
+    tokens: f64,
+    last_ms: u64,
+}
+
 impl AuthInfo {
     fn unknown() -> Self {
         Self {
@@ -658,14 +787,57 @@ impl AuthInfo {
     }
 }
 
+impl RateLimiter {
+    fn check(
+        &self,
+        client_key: &str,
+        tool_key: &str,
+        capacity: f64,
+        refill_per_sec: f64,
+        now_ms: u64,
+    ) -> Option<u64> {
+        if capacity <= 0.0 {
+            return Some(0);
+        }
+        let key = format!("{client_key}:{tool_key}");
+        let mut guard = match self.buckets.lock() {
+            Ok(g) => g,
+            Err(_) => return Some(0),
+        };
+        let bucket = guard.entry(key).or_insert(BucketState {
+            tokens: capacity,
+            last_ms: now_ms,
+        });
+
+        let elapsed_ms = now_ms.saturating_sub(bucket.last_ms);
+        if refill_per_sec > 0.0 {
+            let refill = (elapsed_ms as f64 / 1000.0) * refill_per_sec;
+            bucket.tokens = (bucket.tokens + refill).min(capacity);
+        }
+        bucket.last_ms = now_ms;
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            None
+        } else if refill_per_sec <= 0.0 {
+            Some(u64::MAX)
+        } else {
+            let needed = 1.0 - bucket.tokens;
+            let retry_after_ms = ((needed / refill_per_sec) * 1000.0).ceil().max(0.0) as u64;
+            Some(retry_after_ms)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_client_message(
-    policy: &Policy,
+    policy: &CompiledPolicy,
     approval_store_path: &Path,
     child_in: &mut std::process::ChildStdin,
     child_out: &mut std::process::ChildStdout,
     upstream_partial: &mut Vec<u8>,
     schema_cache: &mut HashMap<String, Value>,
+    rate_limiter: &RateLimiter,
     audit: Option<&AuditLogger>,
     audit_checkpoint_path: Option<&Path>,
     config: &ProxyConfig,
@@ -692,6 +864,9 @@ fn process_client_message(
                         Some(false),
                         None,
                         None,
+                        None,
+                        None,
+                        None,
                     );
                     responses.push(resp);
                     continue;
@@ -703,6 +878,7 @@ fn process_client_message(
                     child_out,
                     upstream_partial,
                     schema_cache,
+                    rate_limiter,
                     audit,
                     audit_checkpoint_path,
                     config,
@@ -724,6 +900,7 @@ fn process_client_message(
             child_out,
             upstream_partial,
             schema_cache,
+            rate_limiter,
             audit,
             audit_checkpoint_path,
             config,
@@ -745,6 +922,9 @@ fn process_client_message(
                 Some(false),
                 None,
                 None,
+                None,
+                None,
+                None,
             );
             Ok(Some(invalid_request(Value::Null, "Invalid Request")))
         }
@@ -753,18 +933,26 @@ fn process_client_message(
 
 #[allow(clippy::too_many_arguments)]
 fn process_single_message(
-    policy: &Policy,
+    policy: &CompiledPolicy,
     approval_store_path: &Path,
     child_in: &mut std::process::ChildStdin,
     child_out: &mut std::process::ChildStdout,
     upstream_partial: &mut Vec<u8>,
     schema_cache: &mut HashMap<String, Value>,
+    rate_limiter: &RateLimiter,
     audit: Option<&AuditLogger>,
     audit_checkpoint_path: Option<&Path>,
     config: &ProxyConfig,
     request: &Value,
 ) -> Result<Option<Value>> {
-    let outcome = evaluate_request(policy, approval_store_path, request, schema_cache, config)?;
+    let outcome = evaluate_request(
+        policy,
+        approval_store_path,
+        request,
+        schema_cache,
+        config,
+        rate_limiter,
+    )?;
     log_client_request(audit, audit_checkpoint_path, config, &outcome.meta);
 
     match outcome.action {
@@ -790,6 +978,9 @@ fn process_single_message(
                 outcome.meta.auth_verified,
                 outcome.meta.token_key_id,
                 outcome.meta.token_digest,
+                outcome.meta.rule_id,
+                outcome.meta.rule_index,
+                outcome.meta.policy_reasons,
             );
             Ok(Some(resp))
         }
@@ -815,6 +1006,9 @@ fn process_single_message(
                     outcome.meta.auth_verified,
                     outcome.meta.token_key_id,
                     outcome.meta.token_digest,
+                    outcome.meta.rule_id,
+                    outcome.meta.rule_index,
+                    outcome.meta.policy_reasons,
                     &upstream_resp,
                 );
 
@@ -827,11 +1021,12 @@ fn process_single_message(
 }
 
 fn evaluate_request(
-    policy: &Policy,
+    policy: &CompiledPolicy,
     approval_store_path: &Path,
     request: &Value,
     schema_cache: &HashMap<String, Value>,
     config: &ProxyConfig,
+    rate_limiter: &RateLimiter,
 ) -> Result<EvalOutcome> {
     if !request.is_object() {
         return Ok(EvalOutcome {
@@ -848,6 +1043,9 @@ fn evaluate_request(
                 auth_verified: Some(false),
                 token_key_id: None,
                 token_digest: None,
+                rule_id: None,
+                rule_index: None,
+                policy_reasons: None,
             },
         });
     }
@@ -874,6 +1072,9 @@ fn evaluate_request(
                 auth_verified: Some(false),
                 token_key_id: None,
                 token_digest: None,
+                rule_id: None,
+                rule_index: None,
+                policy_reasons: None,
             },
         });
     }
@@ -902,6 +1103,9 @@ fn evaluate_request(
                 auth_verified: Some(auth_info.auth_verified),
                 token_key_id: auth_info.token_key_id.clone(),
                 token_digest: auth_info.token_digest.clone(),
+                rule_id: None,
+                rule_index: None,
+                policy_reasons: None,
             },
         });
     };
@@ -926,16 +1130,81 @@ fn evaluate_request(
         .map(|(d, b)| (Some(d), Some(b)))
         .unwrap_or((None, None));
     let args_sample = sample_for_audit(&args_value, config);
-    let decision = evaluate_with_context(
-        policy,
-        &method,
-        &params,
+    let eval = policy.evaluate_with_context(
+        &request_from_params(&method, &params),
         &RequestContext {
-            client_id: auth_info.client_id.clone(),
+            client_id: if auth_info.auth_verified {
+                auth_info.client_id.clone()
+            } else {
+                None
+            },
             auth_verified: Some(auth_info.auth_verified),
-            token_key_id: auth_info.token_key_id.clone(),
+            token_key_id: if auth_info.auth_verified {
+                auth_info.token_key_id.clone()
+            } else {
+                None
+            },
         },
     );
+    let decision = eval.decision.clone();
+    let rule_id = eval.matched_rule_id.clone();
+    let rule_index = eval.matched_rule_index;
+    let explain_reasons: Vec<String> = eval
+        .reasons
+        .into_iter()
+        .take(5)
+        .map(|r| r.message)
+        .collect();
+
+    if decision != Decision::Deny {
+        if let Some(limit) = eval.rate_limit {
+            let client_key = if auth_info.auth_verified {
+                auth_info
+                    .client_id
+                    .clone()
+                    .unwrap_or_else(|| "<anon>".to_string())
+            } else {
+                "<anon>".to_string()
+            };
+            let tool_key = tool_name.clone().unwrap_or_else(|| "<unknown>".to_string());
+            let now_ms = now_ms();
+            if let Some(retry_after_ms) = rate_limiter.check(
+                &client_key,
+                &tool_key,
+                limit.capacity,
+                limit.refill_per_sec,
+                now_ms,
+            ) {
+                return Ok(EvalOutcome {
+                    action: ProxyAction::Respond(error(
+                        id,
+                        TOOLFW_RATE_LIMITED,
+                        "Rate limited",
+                        Some(json!({
+                            "retry_after_ms": retry_after_ms,
+                            "rule_id": rule_id,
+                        })),
+                    )),
+                    meta: EvalMeta {
+                        id: id_value,
+                        method: Some(method),
+                        tool: tool_name,
+                        decision: Some("rate_limited".to_string()),
+                        args_digest,
+                        args_bytes,
+                        args_sample,
+                        client_id: auth_info.client_id.clone(),
+                        auth_verified: Some(auth_info.auth_verified),
+                        token_key_id: auth_info.token_key_id.clone(),
+                        token_digest: auth_info.token_digest.clone(),
+                        rule_id,
+                        rule_index,
+                        policy_reasons: Some(explain_reasons),
+                    },
+                });
+            }
+        }
+    }
 
     match decision {
         Decision::Allow => {
@@ -956,6 +1225,9 @@ fn evaluate_request(
                         auth_verified: Some(auth_info.auth_verified),
                         token_key_id: auth_info.token_key_id.clone(),
                         token_digest: auth_info.token_digest.clone(),
+                        rule_id: rule_id.clone(),
+                        rule_index,
+                        policy_reasons: Some(explain_reasons.clone()),
                     },
                 });
             }
@@ -973,11 +1245,23 @@ fn evaluate_request(
                     auth_verified: Some(auth_info.auth_verified),
                     token_key_id: auth_info.token_key_id.clone(),
                     token_digest: auth_info.token_digest.clone(),
+                    rule_id,
+                    rule_index,
+                    policy_reasons: Some(explain_reasons),
                 },
             })
         }
         Decision::Deny => Ok(EvalOutcome {
-            action: ProxyAction::Respond(error(id, TOOLFW_DENIED, "Denied by policy", None)),
+            action: ProxyAction::Respond(error(
+                id,
+                TOOLFW_DENIED,
+                "Denied by policy",
+                Some(json!({
+                    "rule_id": rule_id,
+                    "rule_index": rule_index,
+                    "reasons": explain_reasons.clone(),
+                })),
+            )),
             meta: EvalMeta {
                 id: id_value,
                 method: Some(method),
@@ -990,6 +1274,9 @@ fn evaluate_request(
                 auth_verified: Some(auth_info.auth_verified),
                 token_key_id: auth_info.token_key_id.clone(),
                 token_digest: auth_info.token_digest.clone(),
+                rule_id,
+                rule_index,
+                policy_reasons: Some(explain_reasons),
             },
         }),
         Decision::RequireApproval => {
@@ -1017,6 +1304,9 @@ fn evaluate_request(
                                 auth_verified: Some(auth_info.auth_verified),
                                 token_key_id: auth_info.token_key_id.clone(),
                                 token_digest: auth_info.token_digest.clone(),
+                                rule_id: rule_id.clone(),
+                                rule_index,
+                                policy_reasons: Some(explain_reasons.clone()),
                             },
                         });
                     }
@@ -1034,6 +1324,9 @@ fn evaluate_request(
                             auth_verified: Some(auth_info.auth_verified),
                             token_key_id: auth_info.token_key_id.clone(),
                             token_digest: auth_info.token_digest.clone(),
+                            rule_id: rule_id.clone(),
+                            rule_index,
+                            policy_reasons: Some(explain_reasons.clone()),
                         },
                     });
                 }
@@ -1045,7 +1338,12 @@ fn evaluate_request(
                     id,
                     TOOLFW_APPROVAL_REQUIRED,
                     "Approval required",
-                    Some(json!({ "approval_request_id": approval_request_id })),
+                    Some(json!({
+                        "approval_request_id": approval_request_id,
+                        "rule_id": rule_id,
+                        "rule_index": rule_index,
+                        "reasons": explain_reasons.clone(),
+                    })),
                 )),
                 meta: EvalMeta {
                     id: id_value,
@@ -1059,6 +1357,9 @@ fn evaluate_request(
                     auth_verified: Some(auth_info.auth_verified),
                     token_key_id: auth_info.token_key_id.clone(),
                     token_digest: auth_info.token_digest.clone(),
+                    rule_id,
+                    rule_index,
+                    policy_reasons: Some(explain_reasons),
                 },
             })
         }
@@ -1206,6 +1507,8 @@ fn log_client_request(
     event.auth_verified = meta.auth_verified;
     event.token_key_id = meta.token_key_id.clone();
     event.token_digest = meta.token_digest.clone();
+    event.rule_id = meta.rule_id.clone();
+    event.policy_reasons = meta.policy_reasons.clone();
     if audit.append(event).is_ok() {
         maybe_write_checkpoint_with_signing(audit, audit_checkpoint_path, config);
     }
@@ -1227,6 +1530,9 @@ fn log_local_error(
     auth_verified: Option<bool>,
     token_key_id: Option<String>,
     token_digest: Option<String>,
+    rule_id: Option<String>,
+    _rule_index: Option<usize>,
+    policy_reasons: Option<Vec<String>>,
 ) {
     let Some(audit) = audit else {
         return;
@@ -1243,6 +1549,8 @@ fn log_local_error(
     event.auth_verified = auth_verified;
     event.token_key_id = token_key_id;
     event.token_digest = token_digest;
+    event.rule_id = rule_id;
+    event.policy_reasons = policy_reasons;
     if audit.append(event).is_ok() {
         maybe_write_checkpoint_with_signing(audit, audit_checkpoint_path, config);
     }
@@ -1261,6 +1569,9 @@ fn log_upstream_response(
     auth_verified: Option<bool>,
     token_key_id: Option<String>,
     token_digest: Option<String>,
+    rule_id: Option<String>,
+    _rule_index: Option<usize>,
+    policy_reasons: Option<Vec<String>>,
     upstream_resp: &Value,
 ) {
     let Some(audit) = audit else {
@@ -1279,6 +1590,8 @@ fn log_upstream_response(
     event.auth_verified = auth_verified;
     event.token_key_id = token_key_id;
     event.token_digest = token_digest;
+    event.rule_id = rule_id;
+    event.policy_reasons = policy_reasons;
     if !result_digest.is_empty() {
         event.result_digest = Some(result_digest);
     }

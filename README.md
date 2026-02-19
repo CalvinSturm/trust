@@ -161,3 +161,24 @@ target/debug/toolfw doctor proxy-stdio --policy configs/examples/toolfw.policy.y
 ```
 
 CI enforces `fmt`, `clippy`, `test`, and `cargo deny check`.
+
+## Policy v2 and Explain
+
+Policy v2 adds:
+- `tool_glob` and `mcp_method_glob`
+- `not` sub-match blocks
+- arg operators: `exact`, `glob`, `regex`, `contains`, `range`
+- `hard: true` deny override
+- optional per-rule token bucket limits
+
+Explain a decision from the CLI:
+
+```bash
+target/debug/toolfw policy explain --policy configs/examples/toolfw.policy.yaml --request '{"client_id":"alice","auth_verified":true,"mcp_method":"tools/call","tool":"views.query","args":{"view":"notes_recent"}}'
+```
+
+Lint a policy (doctor runs this automatically during preflight):
+
+```bash
+target/debug/toolfw policy lint --policy configs/examples/toolfw.policy.yaml --json
+```

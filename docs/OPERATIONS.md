@@ -31,6 +31,7 @@ The CI workflow enforces:
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
 - `cargo deny check` (supply-chain policy)
+- `toolfw policy lint --policy configs/examples/toolfw.policy.yaml --json` (recommended local preflight gate)
 
 ## Key Rotation and Revocation
 

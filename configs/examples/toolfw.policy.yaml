@@ -4,6 +4,17 @@ protocol_version: "2025-06-18"
 defaults:
   decision: deny
 rules:
+  # - id: hard_deny_env
+  #   priority: 1000
+  #   hard: true
+  #   match:
+  #     mcp_method_glob: "tools/*"
+  #     tool_glob: "files.*"
+  #     args:
+  #       path:
+  #         glob: "**/.env"
+  #   decision: deny
+
   - match:
       mcp_method: "tools/call"
       tool: "views.query"
@@ -22,6 +33,43 @@ rules:
       mcp_method: "tools/call"
       tool: "files.write"
     decision: require_approval
+
+  # - id: safe_files_not_env
+  #   priority: 200
+  #   match:
+  #     mcp_method: "tools/call"
+  #     tool_glob: "files.*"
+  #     not:
+  #       args:
+  #         path:
+  #           glob: "**/.env"
+  #   decision: allow
+
+  # - id: regex_example
+  #   match:
+  #     mcp_method: "tools/call"
+  #     tool: "files.search"
+  #     args:
+  #       query:
+  #         regex: "^[a-zA-Z0-9_\\- ]{1,64}$"
+  #   decision: allow
+
+  # - id: limit_search_per_client
+  #   match:
+  #     auth_verified: true
+  #     mcp_method: "tools/call"
+  #     tool: "files.search"
+  #   limit:
+  #     per_client:
+  #       capacity: 10
+  #       refill_per_sec: 0.2
+  #   decision: allow
+
+  # Warning example (lint): rule missing id.
+  # - match:
+  #     mcp_method: "tools/call"
+  #     tool: "views.query"
+  #   decision: deny
 
   - match:
       mcp_method: "tools/call"

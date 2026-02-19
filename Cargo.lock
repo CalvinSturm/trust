@@ -2374,6 +2374,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "globset",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",
