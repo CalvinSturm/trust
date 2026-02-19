@@ -6,6 +6,19 @@ This repo includes a Chrome MV3 extension and a local Native Messaging host:
 - Native host binary: `c2pa-native-host`
 - Host name: `dev.calvinbuild.c2pa_inspect`
 
+## Install From Releases (recommended)
+
+1. Download the latest release assets from GitHub Releases:
+   - `trust-stack-vX.Y.Z-<target>.zip` (Windows) or `.tar.gz` (macOS/Linux)
+   - `c2pa-inspect-extension-vX.Y.Z.zip`
+2. Extract the extension zip and load it from `chrome://extensions` using **Load unpacked**.
+3. Copy the extension ID from `chrome://extensions`.
+4. Register the native host using one of:
+   - `scripts/install_native_host_auto.ps1 -ExtensionId <EXTENSION_ID>`
+   - `scripts/install_native_host_auto.sh --extension-id <EXTENSION_ID>`
+
+The auto installers download platform assets, verify SHA-256 checksums, extract locally, and run native host registration.
+
 ## Build Native Host
 
 ```bash
@@ -68,16 +81,17 @@ Default value must be the absolute path to the manifest JSON.
 ### PowerShell
 
 ```powershell
-./scripts/install_native_host.ps1 -HostName dev.calvinbuild.c2pa_inspect -BinaryPath ./target/release/c2pa-native-host.exe -ExtensionId <EXTENSION_ID>
+./scripts/install_native_host.ps1 -HostName dev.calvinbuild.c2pa_inspect -Binary ./target/release/c2pa-native-host.exe -ExtensionId <EXTENSION_ID>
 ```
 
 ### Bash
 
 ```bash
-./scripts/install_native_host.sh --host-name dev.calvinbuild.c2pa_inspect --binary-path ./target/release/c2pa-native-host --extension-id <EXTENSION_ID>
+./scripts/install_native_host.sh --host-name dev.calvinbuild.c2pa_inspect --binary ./target/release/c2pa-native-host --extension-id <EXTENSION_ID>
 ```
 
 Both scripts are idempotent and overwrite the manifest safely.
+Optional `--manifest-dir` lets you write to a non-default manifest directory.
 
 ## Settings
 
