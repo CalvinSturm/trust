@@ -31,7 +31,7 @@ jobs:
           fi
 
       - name: Build binaries
-        run: cargo build --release -p toolfw -p mcp-gateway -p c2pa-inspect -p c2pa-native-host
+        run: cargo build --release -p toolfw -p mcp-gateway -p c2pa-inspect -p c2pa-native-host -p trust-smoke
 
       - name: Determine target triple
         id: target
@@ -54,11 +54,13 @@ jobs:
             cp target/release/mcp-gateway.exe "$STAGE/bin/"
             cp target/release/c2pa-inspect.exe "$STAGE/bin/"
             cp target/release/c2pa-native-host.exe "$STAGE/bin/"
+            cp target/release/trust-smoke.exe "$STAGE/bin/"
           else
             cp target/release/toolfw "$STAGE/bin/"
             cp target/release/mcp-gateway "$STAGE/bin/"
             cp target/release/c2pa-inspect "$STAGE/bin/"
             cp target/release/c2pa-native-host "$STAGE/bin/"
+            cp target/release/trust-smoke "$STAGE/bin/"
           fi
 
           cp README.md LICENSE-APACHE LICENSE-MIT "$STAGE/"

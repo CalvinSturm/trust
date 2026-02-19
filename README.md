@@ -162,6 +162,22 @@ target/debug/toolfw doctor proxy-stdio --policy configs/examples/toolfw.policy.y
 
 CI enforces `fmt`, `clippy`, `test`, and `cargo deny check`.
 
+## Smoke Test
+
+Run the end-to-end local smoke runner:
+
+```bash
+target/debug/trust-smoke stdio
+```
+
+JSON report output:
+
+```bash
+target/debug/trust-smoke stdio --json
+```
+
+See `docs/SMOKE_TESTS.md` for prerequisites, debugging with `--keep-temp`, and failure interpretation.
+
 ## Policy v2 and Explain
 
 Policy v2 adds:

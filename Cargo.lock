@@ -3718,6 +3718,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7f741b240f1a48843f9b8e0444fb55fb2a4ff67293b50a9179dfd5ea67f8d41"
 
 [[package]]
+name = "trust-smoke"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "audit-log",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "trust-stack"
 version = "0.1.0"
 dependencies = [
