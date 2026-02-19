@@ -29,6 +29,10 @@ enum Commands {
         #[command(subcommand)]
         command: AuthCommands,
     },
+    Doctor {
+        #[command(subcommand)]
+        command: DoctorCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -70,6 +74,34 @@ enum AuditCommands {
         checkpoint: PathBuf,
         #[arg(long)]
         pubkey: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DoctorCommands {
+    ProxyStdio {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        approval_store: Option<PathBuf>,
+        #[arg(long)]
+        audit: Option<PathBuf>,
+        #[arg(long)]
+        audit_checkpoint: Option<PathBuf>,
+        #[arg(long)]
+        audit_signing_key: Option<PathBuf>,
+        #[arg(long)]
+        auth_pubkey: Option<PathBuf>,
+        #[arg(long)]
+        auth_keys: Option<PathBuf>,
+        #[arg(long)]
+        redact: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        audit_payload_sample_bytes: usize,
+        #[arg(long)]
+        gateway_mounts: Option<PathBuf>,
+        #[arg(long)]
+        gateway_views: Option<PathBuf>,
     },
 }
 
@@ -265,6 +297,42 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 let key_id = toolfw_core::auth_rotate(&keys, &out_signing_key, note)?;
                 println!("{key_id}");
                 Ok(())
+            }
+        },
+        Commands::Doctor { command } => match command {
+            DoctorCommands::ProxyStdio {
+                policy,
+                approval_store,
+                audit,
+                audit_checkpoint,
+                audit_signing_key,
+                auth_pubkey,
+                auth_keys,
+                redact,
+                audit_payload_sample_bytes,
+                gateway_mounts,
+                gateway_views,
+            } => {
+                let report =
+                    toolfw_core::doctor_proxy_stdio(&toolfw_core::DoctorProxyStdioOptions {
+                        policy: &policy,
+                        approval_store: approval_store.as_deref(),
+                        audit: audit.as_deref(),
+                        audit_checkpoint: audit_checkpoint.as_deref(),
+                        audit_signing_key: audit_signing_key.as_deref(),
+                        auth_pubkey: auth_pubkey.as_deref(),
+                        auth_keys: auth_keys.as_deref(),
+                        redact: redact.as_deref(),
+                        audit_payload_sample_bytes,
+                        gateway_mounts: gateway_mounts.as_deref(),
+                        gateway_views: gateway_views.as_deref(),
+                    })?;
+                println!("{}", serde_json::to_string(&report)?);
+                if report.ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("doctor found issues"))
+                }
             }
         },
     }

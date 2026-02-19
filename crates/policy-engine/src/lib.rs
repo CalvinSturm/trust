@@ -134,7 +134,7 @@ fn matches_rule(m: &Match, method: &str, params: &Value, ctx: &RequestContext) -
 
 fn glob_matches(pattern: &str, path: &str) -> bool {
     let matcher = compile_glob(pattern);
-    matcher.is_match(path) || matcher.is_match(&format!("x/{path}"))
+    matcher.is_match(path) || matcher.is_match(format!("x/{path}"))
 }
 
 fn compile_glob(pattern: &str) -> GlobMatcher {

@@ -143,3 +143,21 @@ Inspect via MCP through the gateway tool:
 ```
 
 Edit example config paths before real use.
+
+## Developer Workflow
+
+Local quality gates:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Preflight proxy configuration before runtime:
+
+```bash
+target/debug/toolfw doctor proxy-stdio --policy configs/examples/toolfw.policy.yaml --approval-store ./approval-store.json --audit ./audit.jsonl --audit-checkpoint ./audit.checkpoint.json --audit-signing-key ./audit-signing-key.json --auth-keys ./auth-keys.json --gateway-mounts configs/examples/gateway.mounts.yaml --gateway-views configs/examples/gateway.views.yaml
+```
+
+CI enforces `fmt`, `clippy`, `test`, and `cargo deny check`.

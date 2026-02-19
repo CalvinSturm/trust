@@ -123,6 +123,36 @@ struct ProxyConfig {
     auth_keyring: Option<AuthKeyringV1>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DoctorProxyStdioOptions<'a> {
+    pub policy: &'a Path,
+    pub approval_store: Option<&'a Path>,
+    pub audit: Option<&'a Path>,
+    pub audit_checkpoint: Option<&'a Path>,
+    pub audit_signing_key: Option<&'a Path>,
+    pub auth_pubkey: Option<&'a Path>,
+    pub auth_keys: Option<&'a Path>,
+    pub redact: Option<&'a Path>,
+    pub audit_payload_sample_bytes: usize,
+    pub gateway_mounts: Option<&'a Path>,
+    pub gateway_views: Option<&'a Path>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorReport {
+    pub ok: bool,
+    pub issues: Vec<String>,
+    pub warnings: Vec<String>,
+    pub summary: DoctorSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorSummary {
+    pub policy_rules: usize,
+    pub auth: String,
+    pub audit: String,
+}
+
 pub fn issue_approval_token(store_path: &Path, approval_request_id: &str) -> Result<String> {
     with_store_lock(store_path, || {
         let store = ApprovalStore::load_or_init_nolock(store_path)?;
@@ -156,6 +186,107 @@ pub fn audit_verify(audit_path: &Path, checkpoint_path: &Path, pubkey_path: &Pat
     }
 }
 
+pub fn doctor_proxy_stdio(opts: &DoctorProxyStdioOptions<'_>) -> Result<DoctorReport> {
+    let mut issues = Vec::new();
+    let mut warnings = Vec::new();
+    let mut policy_rules = 0usize;
+
+    if opts.auth_pubkey.is_some() && opts.auth_keys.is_some() {
+        issues.push("--auth-pubkey and --auth-keys are mutually exclusive".to_string());
+    }
+    if opts.audit_checkpoint.is_some() && opts.audit.is_none() {
+        issues.push("--audit-checkpoint requires --audit".to_string());
+    }
+    if opts.audit_signing_key.is_some() && (opts.audit_checkpoint.is_none() || opts.audit.is_none())
+    {
+        issues.push("--audit-signing-key requires --audit-checkpoint and --audit".to_string());
+    }
+
+    match fs::read_to_string(opts.policy) {
+        Ok(txt) => match parse_policy(&txt) {
+            Ok(policy) => policy_rules = policy.rules.len(),
+            Err(e) => issues.push(format!("invalid policy yaml: {e}")),
+        },
+        Err(e) => issues.push(format!("policy file unreadable: {e}")),
+    }
+
+    if let Some(path) = opts.redact {
+        if let Err(e) = Redactor::from_yaml(path) {
+            issues.push(format!("invalid redaction config: {e}"));
+        }
+    }
+
+    if let Some(path) = opts.auth_pubkey {
+        if let Err(e) = load_signing_key(path) {
+            issues.push(format!("invalid auth pubkey: {e}"));
+        }
+    }
+    if let Some(path) = opts.auth_keys {
+        if let Err(e) = with_keyring_lock(path, || load_keyring(path)) {
+            issues.push(format!("invalid auth keyring: {e}"));
+        }
+    }
+    if let Some(path) = opts.audit_signing_key {
+        if let Err(e) = load_signing_key(path) {
+            issues.push(format!("invalid audit signing key: {e}"));
+        }
+    }
+
+    if let Some(path) = opts.gateway_mounts {
+        if let Err(e) = parse_mounts_yaml(path) {
+            issues.push(format!("invalid gateway mounts yaml: {e}"));
+        }
+    }
+    if let Some(path) = opts.gateway_views {
+        if let Err(e) = parse_views_yaml(path) {
+            issues.push(format!("invalid gateway views yaml: {e}"));
+        }
+    }
+
+    if let Some(path) = opts.approval_store {
+        check_writable_target(path, "approval store", &mut issues, &mut warnings);
+    }
+    if let Some(path) = opts.audit {
+        check_writable_target(path, "audit log", &mut issues, &mut warnings);
+    }
+    if let Some(path) = opts.audit_checkpoint {
+        check_writable_target(path, "audit checkpoint", &mut issues, &mut warnings);
+    }
+
+    if opts.audit_payload_sample_bytes > 0 && opts.redact.is_none() {
+        warnings
+            .push("audit payload sampling is enabled with default redaction patterns".to_string());
+    }
+
+    let auth = if opts.auth_keys.is_some() {
+        "keyring".to_string()
+    } else if opts.auth_pubkey.is_some() {
+        "pubkey".to_string()
+    } else {
+        "none".to_string()
+    };
+    let audit = if opts.audit_signing_key.is_some() {
+        "signed_checkpoint".to_string()
+    } else if opts.audit_checkpoint.is_some() {
+        "checkpoint".to_string()
+    } else if opts.audit.is_some() {
+        "audit_only".to_string()
+    } else {
+        "none".to_string()
+    };
+
+    Ok(DoctorReport {
+        ok: issues.is_empty(),
+        issues,
+        warnings,
+        summary: DoctorSummary {
+            policy_rules,
+            auth,
+            audit,
+        },
+    })
+}
+
 pub fn auth_issue(
     signing_key_path: &Path,
     client_id: &str,
@@ -179,6 +310,100 @@ pub fn auth_issue(
         },
     };
     issue_capability_token(&key, payload)
+}
+
+#[derive(Debug, Deserialize)]
+struct DoctorMountsConfig {
+    mounts: Vec<DoctorMountSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DoctorMountSpec {
+    name: String,
+    root: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DoctorViewsConfig {
+    views: Vec<DoctorViewSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DoctorViewSpec {
+    name: String,
+    tool: String,
+}
+
+fn parse_mounts_yaml(path: &Path) -> Result<()> {
+    let txt = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let parsed: DoctorMountsConfig =
+        serde_yaml::from_str(&txt).with_context(|| format!("parse {}", path.display()))?;
+    for mount in parsed.mounts {
+        if mount.name.trim().is_empty() {
+            bail!("mount name must not be empty");
+        }
+        if mount.root.trim().is_empty() {
+            bail!("mount root must not be empty");
+        }
+    }
+    Ok(())
+}
+
+fn parse_views_yaml(path: &Path) -> Result<()> {
+    let txt = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let parsed: DoctorViewsConfig =
+        serde_yaml::from_str(&txt).with_context(|| format!("parse {}", path.display()))?;
+    for view in parsed.views {
+        if view.name.trim().is_empty() {
+            bail!("view name must not be empty");
+        }
+        if view.tool.trim().is_empty() {
+            bail!("view tool must not be empty");
+        }
+    }
+    Ok(())
+}
+
+fn check_writable_target(
+    path: &Path,
+    label: &str,
+    issues: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if path.exists() {
+        if OpenOptions::new().write(true).open(path).is_err() {
+            issues.push(format!("{label} is not writable: {}", path.display()));
+        }
+        return;
+    }
+
+    let Some(parent) = path.parent() else {
+        warnings.push(format!(
+            "cannot determine parent directory writability for {label}: {}",
+            path.display()
+        ));
+        return;
+    };
+
+    match fs::metadata(parent) {
+        Ok(meta) => {
+            if !meta.is_dir() {
+                issues.push(format!(
+                    "parent for {label} is not a directory: {}",
+                    parent.display()
+                ));
+            } else if meta.permissions().readonly() {
+                issues.push(format!(
+                    "parent directory for {label} is read-only: {}",
+                    parent.display()
+                ));
+            }
+        }
+        Err(e) => issues.push(format!(
+            "parent directory for {label} is not accessible: {} ({e})",
+            parent.display()
+        )),
+    }
 }
 
 pub fn auth_verify(
@@ -285,6 +510,7 @@ pub fn auth_rotate(
     Ok(key.key_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_proxy_stdio(
     policy_path: &Path,
     approval_store_path: &Path,
@@ -432,6 +658,7 @@ impl AuthInfo {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_client_message(
     policy: &Policy,
     approval_store_path: &Path,
@@ -524,6 +751,7 @@ fn process_client_message(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_single_message(
     policy: &Policy,
     approval_store_path: &Path,
@@ -1281,7 +1509,7 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn from_hex(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         bail!("invalid hex length")
     }
     let mut out = Vec::with_capacity(s.len() / 2);

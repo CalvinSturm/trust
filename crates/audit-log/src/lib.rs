@@ -388,7 +388,7 @@ fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             .truncate(true)
             .open(&tmp)
             .with_context(|| format!("open checkpoint temp {}", tmp.display()))?;
-        f.write_all(&bytes)
+        f.write_all(bytes)
             .with_context(|| format!("write checkpoint temp {}", tmp.display()))?;
         f.sync_all()
             .with_context(|| format!("sync checkpoint temp {}", tmp.display()))?;
