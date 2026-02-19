@@ -1,5 +1,5 @@
 [package]
-name = "toolfw-core"
+name = "cap-token"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,14 +9,11 @@ anyhow.workspace = true
 auth-keyring = { path = "../auth-keyring" }
 audit-log = { path = "../audit-log" }
 base64.workspace = true
-cap-token = { path = "../cap-token" }
-hmac.workspace = true
-jsonschema.workspace = true
-mcp-wire = { path = "../mcp-wire" }
-policy-engine = { path = "../policy-engine" }
-rand.workspace = true
-redaction = { path = "../redaction" }
+ed25519-dalek.workspace = true
+hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

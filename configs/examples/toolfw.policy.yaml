@@ -1,4 +1,6 @@
 protocol_version: "2025-06-18"
+# Example proxy launch with keyring auth verification:
+#   toolfw proxy stdio --policy configs/examples/toolfw.policy.yaml --approval-store ./approval-store.json --auth-keys ./auth-keys.json -- mcp-gateway --mounts configs/examples/gateway.mounts.yaml --views configs/examples/gateway.views.yaml --auth-keys ./auth-keys.json
 defaults:
   decision: deny
 rules:
@@ -25,3 +27,12 @@ rules:
       mcp_method: "tools/call"
       tool: "c2pa.inspect"
     decision: allow
+
+  # - match:
+  #     client_id: "alice"
+  #     auth_verified: true
+  #     mcp_method: "tools/call"
+  #     tool: "views.query"
+  #     args:
+  #       view: "notes_recent"
+  #   decision: allow

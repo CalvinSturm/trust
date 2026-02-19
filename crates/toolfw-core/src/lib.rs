@@ -12,11 +12,20 @@ use audit_log::{
     verify_with_checkpoint, verify_with_signed_checkpoint, write_checkpoint,
     write_signed_checkpoint_atomic, AuditEvent, AuditLogger, Direction, SigningKeyFile,
 };
+use auth_keyring::{
+    add_key, empty_keyring, load_keyring, revoke_key, with_keyring_lock, write_keyring_atomic,
+    AuthKeyringV1, KeyStatusV1,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use cap_token::{
+    issue_token as issue_capability_token, token_digest_hex,
+    verify_token as verify_capability_token, verify_token_with_keyring as verify_with_keyring,
+    AllowSpecV1, CapabilityTokenPayloadV1,
+};
 use hmac::{Hmac, Mac};
 use jsonschema::JSONSchema;
 use mcp_wire::{error, read_json_line_streaming, Id};
-use policy_engine::{evaluate, parse_policy, Decision, Policy};
+use policy_engine::{evaluate_with_context, parse_policy, Decision, Policy, RequestContext};
 use rand::{distributions::Alphanumeric, Rng};
 use redaction::Redactor;
 use serde::{Deserialize, Serialize};
@@ -111,6 +120,7 @@ struct ProxyConfig {
     redactor: Redactor,
     audit_sample_bytes: usize,
     audit_signing_key: Option<SigningKeyFile>,
+    auth_keyring: Option<AuthKeyringV1>,
 }
 
 pub fn issue_approval_token(store_path: &Path, approval_request_id: &str) -> Result<String> {
@@ -146,12 +156,143 @@ pub fn audit_verify(audit_path: &Path, checkpoint_path: &Path, pubkey_path: &Pat
     }
 }
 
+pub fn auth_issue(
+    signing_key_path: &Path,
+    client_id: &str,
+    tools: Vec<String>,
+    views: Vec<String>,
+    mounts: Vec<String>,
+    ttl_seconds: Option<u64>,
+) -> Result<String> {
+    let key = load_signing_key(signing_key_path)?;
+    let now_ms = now_ms();
+    let payload = CapabilityTokenPayloadV1 {
+        version: 1,
+        key_id: key.key_id.clone(),
+        client_id: client_id.to_string(),
+        issued_at_ms: now_ms,
+        expires_at_ms: ttl_seconds.map(|t| now_ms.saturating_add(t.saturating_mul(1000))),
+        allow: AllowSpecV1 {
+            tools,
+            views,
+            mounts,
+        },
+    };
+    issue_capability_token(&key, payload)
+}
+
+pub fn auth_verify(
+    pubkey_path: Option<&Path>,
+    keyring_path: Option<&Path>,
+    token: &str,
+) -> Result<Value> {
+    if pubkey_path.is_some() && keyring_path.is_some() {
+        bail!("--pubkey and --keys are mutually exclusive");
+    }
+    let payload = if let Some(path) = keyring_path {
+        let ring = with_keyring_lock(path, || load_keyring(path))?;
+        verify_with_keyring(token, &ring, now_ms())?
+    } else if let Some(path) = pubkey_path {
+        let key = load_signing_key(path)?;
+        verify_capability_token(token, &key, now_ms())?
+    } else {
+        bail!("one of --pubkey or --keys is required");
+    };
+    serde_json::to_value(json!({
+        "client_id": payload.client_id,
+        "key_id": payload.key_id,
+        "expires_at_ms": payload.expires_at_ms,
+        "allow": payload.allow,
+    }))
+    .context("serialize auth verify summary")
+}
+
+pub fn keyring_init(out_path: &Path) -> Result<()> {
+    let ring = empty_keyring(now_ms());
+    with_keyring_lock(out_path, || write_keyring_atomic(out_path, &ring))
+}
+
+pub fn keyring_add(keys_path: &Path, pubkey_path: &Path, note: Option<String>) -> Result<()> {
+    let key = load_signing_key(pubkey_path)?;
+    with_keyring_lock(keys_path, || {
+        let mut ring = if keys_path.exists() {
+            load_keyring(keys_path)?
+        } else {
+            empty_keyring(now_ms())
+        };
+        add_key(
+            &mut ring,
+            key.key_id.clone(),
+            key.public_key_b64.clone(),
+            note,
+            now_ms(),
+        )?;
+        write_keyring_atomic(keys_path, &ring)
+    })
+}
+
+pub fn keyring_revoke(keys_path: &Path, key_id: &str, note: Option<String>) -> Result<()> {
+    with_keyring_lock(keys_path, || {
+        let mut ring = load_keyring(keys_path)?;
+        revoke_key(&mut ring, key_id, note, now_ms())?;
+        write_keyring_atomic(keys_path, &ring)
+    })
+}
+
+pub fn keyring_list(keys_path: &Path) -> Result<Value> {
+    let ring = with_keyring_lock(keys_path, || load_keyring(keys_path))?;
+    Ok(json!({
+        "version": ring.version,
+        "updated_at_ms": ring.updated_at_ms,
+        "keys": ring.keys.into_iter().map(|k| {
+            json!({
+                "key_id": k.key_id,
+                "status": match k.status {
+                    KeyStatusV1::Active => "active",
+                    KeyStatusV1::Revoked => "revoked",
+                },
+                "added_at_ms": k.added_at_ms,
+                "revoked_at_ms": k.revoked_at_ms,
+                "note": k.note,
+            })
+        }).collect::<Vec<_>>()
+    }))
+}
+
+pub fn auth_rotate(
+    keys_path: &Path,
+    out_signing_key: &Path,
+    note: Option<String>,
+) -> Result<String> {
+    let key = generate_signing_key();
+    audit_log::write_signing_key_atomic(out_signing_key, &key)?;
+    with_keyring_lock(keys_path, || {
+        let mut ring = if keys_path.exists() {
+            load_keyring(keys_path)?
+        } else {
+            empty_keyring(now_ms())
+        };
+        add_key(
+            &mut ring,
+            key.key_id.clone(),
+            key.public_key_b64.clone(),
+            note,
+            now_ms(),
+        )?;
+        write_keyring_atomic(keys_path, &ring)?;
+        Ok(())
+    })?;
+    Ok(key.key_id)
+}
+
 pub fn run_proxy_stdio(
     policy_path: &Path,
     approval_store_path: &Path,
     audit_path: Option<&Path>,
     audit_checkpoint_path: Option<&Path>,
     audit_signing_key_path: Option<&Path>,
+    auth_pubkey_path: Option<&Path>,
+    auth_keys_path: Option<&Path>,
     redact_path: Option<&Path>,
     audit_payload_sample_bytes: usize,
     upstream_cmd: &[String],
@@ -164,6 +305,9 @@ pub fn run_proxy_stdio(
     }
     if audit_signing_key_path.is_some() && audit_checkpoint_path.is_none() {
         bail!("--audit-signing-key requires --audit-checkpoint");
+    }
+    if auth_pubkey_path.is_some() && auth_keys_path.is_some() {
+        bail!("--auth-pubkey and --auth-keys are mutually exclusive");
     }
 
     let policy = {
@@ -181,6 +325,14 @@ pub fn run_proxy_stdio(
         audit_sample_bytes: audit_payload_sample_bytes,
         audit_signing_key: if let Some(path) = audit_signing_key_path {
             Some(load_signing_key(path)?)
+        } else {
+            None
+        },
+        auth_keyring: if let Some(path) = auth_keys_path {
+            Some(with_keyring_lock(path, || load_keyring(path))?)
+        } else if let Some(path) = auth_pubkey_path {
+            let key = load_signing_key(path)?;
+            Some(single_key_keyring(&key)?)
         } else {
             None
         },
@@ -250,11 +402,34 @@ struct EvalMeta {
     args_digest: Option<String>,
     args_bytes: Option<usize>,
     args_sample: Option<Value>,
+    client_id: Option<String>,
+    auth_verified: Option<bool>,
+    token_key_id: Option<String>,
+    token_digest: Option<String>,
 }
 
 struct EvalOutcome {
     action: ProxyAction,
     meta: EvalMeta,
+}
+
+#[derive(Debug, Clone)]
+struct AuthInfo {
+    client_id: Option<String>,
+    auth_verified: bool,
+    token_key_id: Option<String>,
+    token_digest: Option<String>,
+}
+
+impl AuthInfo {
+    fn unknown() -> Self {
+        Self {
+            client_id: Some("<unknown>".to_string()),
+            auth_verified: false,
+            token_key_id: None,
+            token_digest: None,
+        }
+    }
 }
 
 fn process_client_message(
@@ -285,6 +460,10 @@ fn process_client_message(
                         None,
                         None,
                         -32600,
+                        None,
+                        Some("<unknown>".to_string()),
+                        Some(false),
+                        None,
                         None,
                     );
                     responses.push(resp);
@@ -335,6 +514,10 @@ fn process_client_message(
                 None,
                 -32600,
                 None,
+                Some("<unknown>".to_string()),
+                Some(false),
+                None,
+                None,
             );
             Ok(Some(invalid_request(Value::Null, "Invalid Request")))
         }
@@ -375,6 +558,10 @@ fn process_single_message(
                 outcome.meta.args_digest,
                 error_code,
                 error_data_sample,
+                outcome.meta.client_id,
+                outcome.meta.auth_verified,
+                outcome.meta.token_key_id,
+                outcome.meta.token_digest,
             );
             Ok(Some(resp))
         }
@@ -396,6 +583,10 @@ fn process_single_message(
                     outcome.meta.method,
                     outcome.meta.tool,
                     outcome.meta.decision,
+                    outcome.meta.client_id,
+                    outcome.meta.auth_verified,
+                    outcome.meta.token_key_id,
+                    outcome.meta.token_digest,
                     &upstream_resp,
                 );
 
@@ -425,6 +616,10 @@ fn evaluate_request(
                 args_digest: None,
                 args_bytes: None,
                 args_sample: None,
+                client_id: Some("<unknown>".to_string()),
+                auth_verified: Some(false),
+                token_key_id: None,
+                token_digest: None,
             },
         });
     }
@@ -447,9 +642,15 @@ fn evaluate_request(
                 args_digest: None,
                 args_bytes: None,
                 args_sample: None,
+                client_id: Some("<unknown>".to_string()),
+                auth_verified: Some(false),
+                token_key_id: None,
+                token_digest: None,
             },
         });
     }
+
+    let auth_info = auth_info_from_request(request, config);
 
     let id = request.get("id").and_then(parse_id);
     let Some(id) = id else {
@@ -469,6 +670,10 @@ fn evaluate_request(
                 args_digest: None,
                 args_bytes: None,
                 args_sample: None,
+                client_id: auth_info.client_id.clone(),
+                auth_verified: Some(auth_info.auth_verified),
+                token_key_id: auth_info.token_key_id.clone(),
+                token_digest: auth_info.token_digest.clone(),
             },
         });
     };
@@ -493,8 +698,16 @@ fn evaluate_request(
         .map(|(d, b)| (Some(d), Some(b)))
         .unwrap_or((None, None));
     let args_sample = sample_for_audit(&args_value, config);
-
-    let decision = evaluate(policy, &method, &params);
+    let decision = evaluate_with_context(
+        policy,
+        &method,
+        &params,
+        &RequestContext {
+            client_id: auth_info.client_id.clone(),
+            auth_verified: Some(auth_info.auth_verified),
+            token_key_id: auth_info.token_key_id.clone(),
+        },
+    );
 
     match decision {
         Decision::Allow => {
@@ -511,6 +724,10 @@ fn evaluate_request(
                         args_digest,
                         args_bytes,
                         args_sample,
+                        client_id: auth_info.client_id.clone(),
+                        auth_verified: Some(auth_info.auth_verified),
+                        token_key_id: auth_info.token_key_id.clone(),
+                        token_digest: auth_info.token_digest.clone(),
                     },
                 });
             }
@@ -524,6 +741,10 @@ fn evaluate_request(
                     args_digest,
                     args_bytes,
                     args_sample,
+                    client_id: auth_info.client_id.clone(),
+                    auth_verified: Some(auth_info.auth_verified),
+                    token_key_id: auth_info.token_key_id.clone(),
+                    token_digest: auth_info.token_digest.clone(),
                 },
             })
         }
@@ -537,6 +758,10 @@ fn evaluate_request(
                 args_digest,
                 args_bytes,
                 args_sample,
+                client_id: auth_info.client_id.clone(),
+                auth_verified: Some(auth_info.auth_verified),
+                token_key_id: auth_info.token_key_id.clone(),
+                token_digest: auth_info.token_digest.clone(),
             },
         }),
         Decision::RequireApproval => {
@@ -560,6 +785,10 @@ fn evaluate_request(
                                 args_digest,
                                 args_bytes,
                                 args_sample,
+                                client_id: auth_info.client_id.clone(),
+                                auth_verified: Some(auth_info.auth_verified),
+                                token_key_id: auth_info.token_key_id.clone(),
+                                token_digest: auth_info.token_digest.clone(),
                             },
                         });
                     }
@@ -573,6 +802,10 @@ fn evaluate_request(
                             args_digest,
                             args_bytes,
                             args_sample,
+                            client_id: auth_info.client_id.clone(),
+                            auth_verified: Some(auth_info.auth_verified),
+                            token_key_id: auth_info.token_key_id.clone(),
+                            token_digest: auth_info.token_digest.clone(),
                         },
                     });
                 }
@@ -594,9 +827,53 @@ fn evaluate_request(
                     args_digest,
                     args_bytes,
                     args_sample,
+                    client_id: auth_info.client_id.clone(),
+                    auth_verified: Some(auth_info.auth_verified),
+                    token_key_id: auth_info.token_key_id.clone(),
+                    token_digest: auth_info.token_digest.clone(),
                 },
             })
         }
+    }
+}
+
+fn auth_info_from_request(request: &Value, config: &ProxyConfig) -> AuthInfo {
+    let token = request
+        .get("params")
+        .and_then(|p| p.get("auth"))
+        .and_then(|a| a.get("token"))
+        .and_then(Value::as_str);
+    let Some(token) = token else {
+        return AuthInfo::unknown();
+    };
+
+    let digest = token_digest_hex(token);
+    let Some(keyring) = config.auth_keyring.as_ref() else {
+        return AuthInfo {
+            client_id: Some("<unknown>".to_string()),
+            auth_verified: false,
+            token_key_id: None,
+            token_digest: Some(digest),
+        };
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    match verify_with_keyring(token, keyring, now_ms) {
+        Ok(payload) => AuthInfo {
+            client_id: Some(payload.client_id),
+            auth_verified: true,
+            token_key_id: Some(payload.key_id),
+            token_digest: Some(digest),
+        },
+        Err(_) => AuthInfo {
+            client_id: Some("<unknown>".to_string()),
+            auth_verified: false,
+            token_key_id: None,
+            token_digest: Some(digest),
+        },
     }
 }
 
@@ -697,6 +974,10 @@ fn log_client_request(
     event.args_digest = meta.args_digest.clone();
     event.args_bytes = meta.args_bytes;
     event.args_sample = meta.args_sample.clone();
+    event.client_id = meta.client_id.clone();
+    event.auth_verified = meta.auth_verified;
+    event.token_key_id = meta.token_key_id.clone();
+    event.token_digest = meta.token_digest.clone();
     if audit.append(event).is_ok() {
         maybe_write_checkpoint_with_signing(audit, audit_checkpoint_path, config);
     }
@@ -714,6 +995,10 @@ fn log_local_error(
     args_digest: Option<String>,
     error_code: i64,
     error_data_sample: Option<Value>,
+    client_id: Option<String>,
+    auth_verified: Option<bool>,
+    token_key_id: Option<String>,
+    token_digest: Option<String>,
 ) {
     let Some(audit) = audit else {
         return;
@@ -726,6 +1011,10 @@ fn log_local_error(
     event.args_digest = args_digest;
     event.error_code = Some(error_code);
     event.error_data_sample = error_data_sample;
+    event.client_id = client_id;
+    event.auth_verified = auth_verified;
+    event.token_key_id = token_key_id;
+    event.token_digest = token_digest;
     if audit.append(event).is_ok() {
         maybe_write_checkpoint_with_signing(audit, audit_checkpoint_path, config);
     }
@@ -740,6 +1029,10 @@ fn log_upstream_response(
     method: Option<String>,
     tool: Option<String>,
     decision: Option<String>,
+    client_id: Option<String>,
+    auth_verified: Option<bool>,
+    token_key_id: Option<String>,
+    token_digest: Option<String>,
     upstream_resp: &Value,
 ) {
     let Some(audit) = audit else {
@@ -754,6 +1047,10 @@ fn log_upstream_response(
     event.method = method;
     event.tool = tool;
     event.decision = decision;
+    event.client_id = client_id;
+    event.auth_verified = auth_verified;
+    event.token_key_id = token_key_id;
+    event.token_digest = token_digest;
     if !result_digest.is_empty() {
         event.result_digest = Some(result_digest);
     }
@@ -958,6 +1255,25 @@ fn parse_id(v: &Value) -> Option<Id> {
         Value::String(s) => Some(Id::String(s.clone())),
         _ => None,
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn single_key_keyring(key: &SigningKeyFile) -> Result<AuthKeyringV1> {
+    let mut ring = empty_keyring(now_ms());
+    add_key(
+        &mut ring,
+        key.key_id.clone(),
+        key.public_key_b64.clone(),
+        Some("wrapped from --auth-pubkey".to_string()),
+        now_ms(),
+    )?;
+    Ok(ring)
 }
 
 fn to_hex(bytes: &[u8]) -> String {

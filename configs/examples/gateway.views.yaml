@@ -1,4 +1,7 @@
 views:
+  # Example gateway launch with keyring auth:
+  #   mcp-gateway --mounts configs/examples/gateway.mounts.yaml --views configs/examples/gateway.views.yaml --auth-keys ./auth-keys.json
+  # Views are the easiest way to scope capability tokens (allow specific view names).
   - name: notes_recent
     tool: files.search
     args:

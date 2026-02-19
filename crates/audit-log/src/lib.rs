@@ -48,6 +48,14 @@ pub struct AuditEvent {
     pub result_sample: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_data_sample: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_verified: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_digest: Option<String>,
 }
 
 impl AuditEvent {
@@ -67,6 +75,10 @@ impl AuditEvent {
             args_sample: None,
             result_sample: None,
             error_data_sample: None,
+            client_id: None,
+            auth_verified: None,
+            token_key_id: None,
+            token_digest: None,
         }
     }
 }

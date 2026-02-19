@@ -25,6 +25,10 @@ enum Commands {
         #[command(subcommand)]
         command: AuditCommands,
     },
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -40,6 +44,10 @@ enum ProxyCommands {
         audit_checkpoint: Option<PathBuf>,
         #[arg(long)]
         audit_signing_key: Option<PathBuf>,
+        #[arg(long)]
+        auth_pubkey: Option<PathBuf>,
+        #[arg(long)]
+        auth_keys: Option<PathBuf>,
         #[arg(long)]
         redact: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
@@ -62,6 +70,74 @@ enum AuditCommands {
         checkpoint: PathBuf,
         #[arg(long)]
         pubkey: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommands {
+    Keyring {
+        #[command(subcommand)]
+        command: AuthKeyringCommands,
+    },
+    Issue {
+        #[arg(long)]
+        signing_key: PathBuf,
+        #[arg(long)]
+        client: String,
+        #[arg(long)]
+        tools: String,
+        #[arg(long)]
+        views: Option<String>,
+        #[arg(long)]
+        mounts: Option<String>,
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
+    },
+    Verify {
+        #[arg(long)]
+        pubkey: Option<PathBuf>,
+        #[arg(long)]
+        keys: Option<PathBuf>,
+        #[arg(long)]
+        token: String,
+    },
+    Rotate {
+        #[arg(long)]
+        keys: PathBuf,
+        #[arg(long)]
+        out_signing_key: PathBuf,
+        #[arg(long)]
+        note: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthKeyringCommands {
+    Init {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    Add {
+        #[arg(long)]
+        keys: PathBuf,
+        #[arg(long)]
+        pubkey: PathBuf,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    Revoke {
+        #[arg(long)]
+        keys: PathBuf,
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    List {
+        #[arg(long)]
+        keys: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -93,6 +169,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     audit,
                     audit_checkpoint,
                     audit_signing_key,
+                    auth_pubkey,
+                    auth_keys,
                     redact,
                     audit_payload_sample_bytes,
                     upstream,
@@ -103,6 +181,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             audit.as_deref(),
             audit_checkpoint.as_deref(),
             audit_signing_key.as_deref(),
+            auth_pubkey.as_deref(),
+            auth_keys.as_deref(),
             redact.as_deref(),
             audit_payload_sample_bytes,
             &upstream,
@@ -127,5 +207,73 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 pubkey,
             } => toolfw_core::audit_verify(&audit, &checkpoint, &pubkey),
         },
+        Commands::Auth { command } => match command {
+            AuthCommands::Keyring { command } => match command {
+                AuthKeyringCommands::Init { out } => toolfw_core::keyring_init(&out),
+                AuthKeyringCommands::Add { keys, pubkey, note } => {
+                    toolfw_core::keyring_add(&keys, &pubkey, note)
+                }
+                AuthKeyringCommands::Revoke { keys, key_id, note } => {
+                    toolfw_core::keyring_revoke(&keys, &key_id, note)
+                }
+                AuthKeyringCommands::List { keys, json } => {
+                    let summary = toolfw_core::keyring_list(&keys)?;
+                    if json {
+                        println!("{}", serde_json::to_string(&summary)?);
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&summary)?);
+                    }
+                    Ok(())
+                }
+            },
+            AuthCommands::Issue {
+                signing_key,
+                client,
+                tools,
+                views,
+                mounts,
+                ttl_seconds,
+            } => {
+                let tools = split_csv(&tools);
+                let views = views.map(|v| split_csv(&v)).unwrap_or_default();
+                let mounts = mounts.map(|m| split_csv(&m)).unwrap_or_default();
+                let token = toolfw_core::auth_issue(
+                    &signing_key,
+                    &client,
+                    tools,
+                    views,
+                    mounts,
+                    ttl_seconds,
+                )?;
+                println!("{token}");
+                Ok(())
+            }
+            AuthCommands::Verify {
+                pubkey,
+                keys,
+                token,
+            } => {
+                let summary = toolfw_core::auth_verify(pubkey.as_deref(), keys.as_deref(), &token)?;
+                println!("{}", serde_json::to_string(&summary)?);
+                Ok(())
+            }
+            AuthCommands::Rotate {
+                keys,
+                out_signing_key,
+                note,
+            } => {
+                let key_id = toolfw_core::auth_rotate(&keys, &out_signing_key, note)?;
+                println!("{key_id}");
+                Ok(())
+            }
+        },
     }
+}
+
+fn split_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|x| x.trim())
+        .filter(|x| !x.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }

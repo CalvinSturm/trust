@@ -2,10 +2,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use audit_log::load_signing_key;
+use auth_keyring::{add_key, empty_keyring, load_keyring, with_keyring_lock, AuthKeyringV1};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use c2pa_inspector_core::{inspect_path, parse_trust_mode, InspectOptions, TrustMode};
+use cap_token::verify_token_with_keyring as verify_capability_token;
 use mcp_wire::{error, read_json_line_streaming, success, Id};
 use rusqlite::types::ValueRef;
 use rusqlite::OpenFlags;
@@ -16,6 +20,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+pub const GATEWAY_UNAUTHORIZED: i64 = -32060;
+pub const GATEWAY_FORBIDDEN: i64 = -32061;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MountsConfig {
@@ -54,9 +60,35 @@ enum ResolvePurpose {
     Write,
 }
 
-pub fn run_stdio(mounts_path: &Path, views_path: &Path) -> Result<()> {
+#[derive(Clone)]
+struct AuthConfig {
+    keyring: AuthKeyringV1,
+}
+
+pub fn run_stdio(
+    mounts_path: &Path,
+    views_path: &Path,
+    auth_pubkey: Option<&Path>,
+    auth_keys: Option<&Path>,
+) -> Result<()> {
+    if auth_pubkey.is_some() && auth_keys.is_some() {
+        return Err(anyhow!(
+            "--auth-pubkey and --auth-keys are mutually exclusive"
+        ));
+    }
     let mounts = load_mounts(mounts_path)?;
     let views = load_views(views_path)?;
+    let auth = if let Some(path) = auth_keys {
+        let ring = with_keyring_lock(path, || load_keyring(path))?;
+        Some(AuthConfig { keyring: ring })
+    } else if let Some(path) = auth_pubkey {
+        let key = load_signing_key(path)?;
+        Some(AuthConfig {
+            keyring: keyring_from_signing_key(&key)?,
+        })
+    } else {
+        None
+    };
 
     let mut stdin = io::stdin().lock();
     let stdout = io::stdout();
@@ -64,7 +96,7 @@ pub fn run_stdio(mounts_path: &Path, views_path: &Path) -> Result<()> {
     let mut partial = Vec::new();
 
     while let Some(msg) = read_json_line_streaming(&mut stdin, &mut partial)? {
-        if let Some(resp) = handle_input(&mounts, &views, msg) {
+        if let Some(resp) = handle_input(&mounts, &views, auth.as_ref(), msg) {
             mcp_wire::write_json_line(&mut out, &resp)?;
         }
     }
@@ -109,6 +141,7 @@ fn load_views(path: &Path) -> Result<HashMap<String, ViewSpec>> {
 fn handle_input(
     mounts: &HashMap<String, Mount>,
     views: &HashMap<String, ViewSpec>,
+    auth: Option<&AuthConfig>,
     msg: Value,
 ) -> Option<Value> {
     match msg {
@@ -119,7 +152,7 @@ fn handle_input(
                     responses.push(invalid_request(Value::Null, "Invalid Request"));
                     continue;
                 }
-                if let Some(resp) = handle_message(mounts, views, item) {
+                if let Some(resp) = handle_message(mounts, views, auth, item) {
                     responses.push(resp);
                 }
             }
@@ -129,7 +162,7 @@ fn handle_input(
                 Some(Value::Array(responses))
             }
         }
-        Value::Object(_) => handle_message(mounts, views, msg),
+        Value::Object(_) => handle_message(mounts, views, auth, msg),
         _ => Some(invalid_request(Value::Null, "Invalid Request")),
     }
 }
@@ -137,6 +170,7 @@ fn handle_input(
 fn handle_message(
     mounts: &HashMap<String, Mount>,
     views: &HashMap<String, ViewSpec>,
+    auth: Option<&AuthConfig>,
     msg: Value,
 ) -> Option<Value> {
     let method = msg.get("method")?.as_str()?.to_string();
@@ -189,6 +223,17 @@ fn handle_message(
         "tools/call" => {
             let id = id?;
             let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
+            if let Some(auth) = auth {
+                match authorize_tools_call(&params, auth) {
+                    Ok(()) => {}
+                    Err(AuthzError::Unauthorized) => {
+                        return Some(error(id, GATEWAY_UNAUTHORIZED, "Unauthorized", None));
+                    }
+                    Err(AuthzError::Forbidden) => {
+                        return Some(error(id, GATEWAY_FORBIDDEN, "Forbidden", None));
+                    }
+                }
+            }
             match call_tool(mounts, views, &params) {
                 Ok(result) => Some(success(id, result)),
                 Err(e) => Some(error(id, -32000, &e.to_string(), None)),
@@ -243,6 +288,82 @@ fn call_tool(
         "views.query" => views_query(mounts, views, &args),
         _ => Err(anyhow!("unknown tool")),
     }
+}
+
+enum AuthzError {
+    Unauthorized,
+    Forbidden,
+}
+
+fn authorize_tools_call(params: &Value, auth: &AuthConfig) -> std::result::Result<(), AuthzError> {
+    let token = params
+        .get("auth")
+        .and_then(|a| a.get("token"))
+        .and_then(Value::as_str)
+        .ok_or(AuthzError::Unauthorized)?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let payload = verify_capability_token(token, &auth.keyring, now_ms)
+        .map_err(|_| AuthzError::Unauthorized)?;
+
+    let tool = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or(AuthzError::Unauthorized)?;
+    if !payload.allow.tools.iter().any(|t| t == tool) {
+        return Err(AuthzError::Forbidden);
+    }
+
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if tool == "views.query" && !payload.allow.views.is_empty() {
+        let view = args
+            .get("view")
+            .and_then(Value::as_str)
+            .ok_or(AuthzError::Forbidden)?;
+        if !payload.allow.views.iter().any(|v| v == view) {
+            return Err(AuthzError::Forbidden);
+        }
+    }
+
+    let needs_mount_scope = matches!(
+        tool,
+        "files.read" | "files.write" | "files.search" | "sqlite.query"
+    );
+    if needs_mount_scope && !payload.allow.mounts.is_empty() {
+        let mount = args
+            .get("mount")
+            .and_then(Value::as_str)
+            .ok_or(AuthzError::Forbidden)?;
+        if !payload.allow.mounts.iter().any(|m| m == mount) {
+            return Err(AuthzError::Forbidden);
+        }
+    }
+
+    Ok(())
+}
+
+fn keyring_from_signing_key(key: &audit_log::SigningKeyFile) -> Result<AuthKeyringV1> {
+    let mut ring = empty_keyring(now_ms());
+    add_key(
+        &mut ring,
+        key.key_id.clone(),
+        key.public_key_b64.clone(),
+        Some("wrapped from --auth-pubkey".to_string()),
+        now_ms(),
+    )?;
+    Ok(ring)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn mount_and_path<'a>(

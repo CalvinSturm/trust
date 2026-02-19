@@ -8,12 +8,17 @@ This MVP is intended to mitigate:
 - accidental secret leaks via policy deny rules for obvious paths/patterns
 - missing auditability (partial): minimal structured approval state exists now; richer audit logging is planned
 - audit tampering and truncation with hash-chained logs and cryptographically signed checkpoints (when configured)
+- unauthorized tool use when capability-token enforcement is enabled at the gateway
+- stronger request attribution via token-derived client identity in toolfw audit metadata
+- reduced blast radius from key compromise via keyring-based key rotation and revocation
 
 This MVP does not mitigate:
 - a compromised host operating system
 - malicious or compromised upstream server descriptions
 - prompt injection intent understanding
 - full data loss prevention (DLP)
+- token exfiltration from compromised clients or hosts
+- immediate invalidation of already-issued stolen tokens signed by still-active keys
 
 ## Privacy defaults
 

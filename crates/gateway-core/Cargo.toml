@@ -6,7 +6,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+auth-keyring = { path = "../auth-keyring" }
+audit-log = { path = "../audit-log" }
 base64.workspace = true
+cap-token = { path = "../cap-token" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

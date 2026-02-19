@@ -235,6 +235,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "auth-keyring"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -527,6 +540,22 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "cap-token"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "audit-log",
+ "auth-keyring",
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -1224,8 +1253,11 @@ name = "gateway-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "audit-log",
+ "auth-keyring",
  "base64 0.22.1",
  "c2pa-inspector-core",
+ "cap-token",
  "mcp-wire",
  "rusqlite",
  "serde",
@@ -3555,6 +3587,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde_json",
  "toolfw-core",
 ]
 
@@ -3564,7 +3597,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "audit-log",
+ "auth-keyring",
  "base64 0.22.1",
+ "cap-token",
  "hmac",
  "jsonschema",
  "mcp-wire",
@@ -3663,8 +3698,10 @@ name = "trust-stack"
 version = "0.1.0"
 dependencies = [
  "audit-log",
+ "auth-keyring",
  "base64 0.22.1",
  "c2pa",
+ "cap-token",
  "rcgen",
  "rusqlite",
  "serde_json",
