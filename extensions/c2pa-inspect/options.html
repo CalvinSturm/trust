@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>C2PA Inspect Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <h1>C2PA Inspect Settings</h1>
+    <form id="settingsForm">
+      <label>
+        Trust mode
+        <select id="trustMode">
+          <option value="default">default</option>
+          <option value="off">off</option>
+        </select>
+      </label>
+      <label>
+        Max download bytes
+        <input id="maxDownloadBytes" type="number" min="1000000" max="200000000" step="1">
+      </label>
+      <label>
+        Timeout (ms)
+        <input id="timeoutMs" type="number" min="1000" max="30000" step="100">
+      </label>
+      <div class="actions">
+        <button type="submit">Save</button>
+        <button type="button" id="resetBtn">Reset to defaults</button>
+      </div>
+    </form>
+    <p id="status"></p>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>
+

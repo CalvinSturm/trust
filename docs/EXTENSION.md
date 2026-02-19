@@ -6,6 +6,19 @@ This repo includes a Chrome MV3 extension and a local Native Messaging host:
 - Native host binary: `c2pa-native-host`
 - Host name: `dev.calvinbuild.c2pa_inspect`
 
+## Install From Releases (recommended)
+
+1. Download the latest release assets from GitHub Releases:
+   - `trust-stack-vX.Y.Z-<target>.zip` (Windows) or `.tar.gz` (macOS/Linux)
+   - `c2pa-inspect-extension-vX.Y.Z.zip`
+2. Extract the extension zip and load it from `chrome://extensions` using **Load unpacked**.
+3. Copy the extension ID from `chrome://extensions`.
+4. Register the native host using one of:
+   - `scripts/install_native_host_auto.ps1 -ExtensionId <EXTENSION_ID>`
+   - `scripts/install_native_host_auto.sh --extension-id <EXTENSION_ID>`
+
+The auto installers download platform assets, verify SHA-256 checksums, extract locally, and run native host registration.
+
 ## Build Native Host
 
 ```bash
@@ -22,6 +35,10 @@ Binary paths:
 2. Enable Developer mode
 3. Click **Load unpacked**
 4. Select `extensions/c2pa-inspect/`
+
+Usage:
+- Right-click an image/link/video: **Inspect Content Credentials**
+- Right-click page background: **Inspect primary media on this page**
 
 ## Native Host Manifest
 
@@ -64,16 +81,26 @@ Default value must be the absolute path to the manifest JSON.
 ### PowerShell
 
 ```powershell
-./scripts/install_native_host.ps1 -HostName dev.calvinbuild.c2pa_inspect -BinaryPath ./target/release/c2pa-native-host.exe -ExtensionId <EXTENSION_ID>
+./scripts/install_native_host.ps1 -HostName dev.calvinbuild.c2pa_inspect -Binary ./target/release/c2pa-native-host.exe -ExtensionId <EXTENSION_ID>
 ```
 
 ### Bash
 
 ```bash
-./scripts/install_native_host.sh --host-name dev.calvinbuild.c2pa_inspect --binary-path ./target/release/c2pa-native-host --extension-id <EXTENSION_ID>
+./scripts/install_native_host.sh --host-name dev.calvinbuild.c2pa_inspect --binary ./target/release/c2pa-native-host --extension-id <EXTENSION_ID>
 ```
 
 Both scripts are idempotent and overwrite the manifest safely.
+Optional `--manifest-dir` lets you write to a non-default manifest directory.
+
+## Settings
+
+Open extension options page and configure:
+- `trust_mode`: `off` or `default`
+- `max_download_bytes`: 1,000,000 to 200,000,000
+- `timeout_ms`: 1,000 to 30,000
+
+Settings are stored in Chrome sync storage (fallback local storage).
 
 ## Security Notes
 
@@ -83,3 +110,19 @@ Both scripts are idempotent and overwrite the manifest safely.
 - Host does not execute shell commands.
 - Host does not log raw media bytes.
 
+## Troubleshooting
+
+- **No media detected**:
+  The page may not expose visible `img/video poster/og:image` candidates. Try direct image right-click.
+- **Blob/data URLs unsupported**:
+  Only `http`/`https` media URLs are allowed.
+- **Timed out / too large**:
+  Increase timeout or max download bytes in extension settings.
+
+## Manual Test Checklist
+
+1. Right-click a page image and run **Inspect Content Credentials**.
+2. Right-click page background and run **Inspect primary media on this page**.
+3. Open options page, switch trust mode and caps, repeat inspection and verify behavior changes.
+4. Confirm result page shows loading then report/error and supports Retry.
+5. Confirm missing credentials show a gentle “may be stripped” hint.

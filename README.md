@@ -225,5 +225,22 @@ Use views-first policies for git whenever possible, and ensure `git` is installe
 Phase 13 adds a Chrome MV3 extension + native messaging host for C2PA inspection:
 - Extension: `extensions/c2pa-inspect`
 - Host binary: `c2pa-native-host`
+- Includes:
+  - right-click media inspect
+  - "Inspect primary media on this page"
+  - settings for trust mode and host caps
 
 Installation and host registration instructions are in `docs/EXTENSION.md`.
+Releases publish prebuilt platform archives, extension zip, and checksums for easier install.
+
+Quick install from release assets (after loading extension and copying its id):
+
+```powershell
+./scripts/install_native_host_auto.ps1 -ExtensionId <EXTENSION_ID>
+```
+
+```bash
+./scripts/install_native_host_auto.sh --extension-id <EXTENSION_ID>
+```
+
+Release process documentation is in `docs/RELEASING.md`.

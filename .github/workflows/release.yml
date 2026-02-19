@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Validate tag matches workspace version
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
+            echo "Tag version v$TAG_VERSION does not match Cargo workspace version $CARGO_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Build binaries
+        run: cargo build --release -p toolfw -p mcp-gateway -p c2pa-inspect -p c2pa-native-host
+
+      - name: Determine target triple
+        id: target
+        shell: bash
+        run: |
+          TARGET=$(rustc -vV | sed -n 's/^host: //p')
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+
+      - name: Stage package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          TARGET="${{ steps.target.outputs.target }}"
+          STAGE="dist/trust-stack-${VERSION}-${TARGET}"
+          mkdir -p "$STAGE/bin" "$STAGE/docs" "$STAGE/scripts" "$STAGE/assets/native-host-manifests"
+
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/release/toolfw.exe "$STAGE/bin/"
+            cp target/release/mcp-gateway.exe "$STAGE/bin/"
+            cp target/release/c2pa-inspect.exe "$STAGE/bin/"
+            cp target/release/c2pa-native-host.exe "$STAGE/bin/"
+          else
+            cp target/release/toolfw "$STAGE/bin/"
+            cp target/release/mcp-gateway "$STAGE/bin/"
+            cp target/release/c2pa-inspect "$STAGE/bin/"
+            cp target/release/c2pa-native-host "$STAGE/bin/"
+          fi
+
+          cp README.md LICENSE-APACHE LICENSE-MIT "$STAGE/"
+          cp docs/EXTENSION.md "$STAGE/docs/"
+          cp scripts/install_native_host.ps1 scripts/install_native_host.sh scripts/install_native_host_auto.ps1 scripts/install_native_host_auto.sh "$STAGE/scripts/"
+          cp assets/native-host-manifests/*.json "$STAGE/assets/native-host-manifests/"
+
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "$env:GITHUB_REF_NAME"
+          $target = "${{ steps.target.outputs.target }}"
+          $base = "trust-stack-$version-$target"
+          Compress-Archive -Path "dist/$base/*" -DestinationPath "dist/$base.zip" -Force
+
+      - name: Create archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          TARGET="${{ steps.target.outputs.target }}"
+          BASE="trust-stack-${VERSION}-${TARGET}"
+          tar -C dist -czf "dist/${BASE}.tar.gz" "$BASE"
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+
+  publish:
+    name: Publish Release Assets
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          find dist -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec cp {} dist/ \;
+
+      - name: Package extension zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          (cd extensions && zip -r "../dist/c2pa-inspect-extension-${VERSION}.zip" c2pa-inspect)
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          pushd dist >/dev/null
+          sha256sum *.zip *.tar.gz > "sha256sums-${VERSION}.txt"
+          popd >/dev/null
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/sha256sums-*.txt

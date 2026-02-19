@@ -1,0 +1,9 @@
+{
+  "name": "__HOST_NAME__",
+  "description": "C2PA inspect native host",
+  "path": "__BINARY_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__EXTENSION_ID__/"
+  ]
+}

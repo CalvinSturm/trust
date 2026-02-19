@@ -13,10 +13,18 @@
       <p id="subtitle">Loading...</p>
     </header>
 
+    <section id="loadingSection" class="card">
+      <div class="loadingWrap">
+        <div class="spinner"></div>
+        <p>Inspecting...</p>
+      </div>
+    </section>
+
     <section id="errorSection" class="card hidden">
       <h2>Error</h2>
       <p id="errorCode" class="mono"></p>
       <p id="errorMessage"></p>
+      <button id="retryBtn" type="button">Retry</button>
     </section>
 
     <section id="reportSection" class="hidden">
@@ -27,6 +35,7 @@
           <p><strong>Trusted:</strong> <span id="trusted"></span></p>
           <p><strong>Trust mode:</strong> <span id="trustMode"></span></p>
           <p><strong>State:</strong> <span id="state"></span></p>
+          <p><strong>Detection reason:</strong> <span id="detectReason"></span></p>
         </article>
 
         <article class="card">
@@ -40,6 +49,11 @@
       <article class="card">
         <h2>Warnings</h2>
         <ul id="warnings"></ul>
+      </article>
+
+      <article id="missingHint" class="card hidden">
+        <h2>No Credentials Found</h2>
+        <p>No C2PA credentials were found. Some platforms strip provenance metadata. Prefer the original file export or source download.</p>
       </article>
 
       <article class="card">
@@ -59,10 +73,12 @@
         <button id="copyJson">Copy JSON</button>
         <button id="copySummary">Copy Summary</button>
       </div>
-      <pre id="rawJson" class="mono"></pre>
+      <details>
+        <summary>Raw JSON</summary>
+        <pre id="rawJson" class="mono"></pre>
+      </details>
     </section>
   </main>
   <script src="result.js"></script>
 </body>
 </html>
-
