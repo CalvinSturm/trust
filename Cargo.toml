@@ -46,6 +46,7 @@ tempfile.workspace = true
 audit-log = { path = "crates/audit-log" }
 auth-keyring = { path = "crates/auth-keyring" }
 cap-token = { path = "crates/cap-token" }
+native-messaging = { path = "crates/native-messaging" }
 rusqlite.workspace = true
 c2pa.workspace = true
 rcgen = "0.13"

@@ -543,6 +543,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "c2pa-native-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "c2pa-inspector-core",
+ "hex",
+ "native-messaging",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "cap-token"
 version = "0.1.0"
 dependencies = [
@@ -1981,6 +1996,14 @@ dependencies = [
  "base256emoji",
  "data-encoding",
  "data-encoding-macro",
+]
+
+[[package]]
+name = "native-messaging"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
 ]
 
 [[package]]
@@ -3703,6 +3726,7 @@ dependencies = [
  "base64 0.22.1",
  "c2pa",
  "cap-token",
+ "native-messaging",
  "rcgen",
  "rusqlite",
  "serde_json",

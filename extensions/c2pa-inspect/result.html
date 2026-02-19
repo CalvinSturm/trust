@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>C2PA Inspect Result</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <h1>Content Credentials</h1>
+      <p id="subtitle">Loading...</p>
+    </header>
+
+    <section id="errorSection" class="card hidden">
+      <h2>Error</h2>
+      <p id="errorCode" class="mono"></p>
+      <p id="errorMessage"></p>
+    </section>
+
+    <section id="reportSection" class="hidden">
+      <div class="grid">
+        <article class="card">
+          <h2>Overview</h2>
+          <p><strong>Present:</strong> <span id="present"></span></p>
+          <p><strong>Trusted:</strong> <span id="trusted"></span></p>
+          <p><strong>Trust mode:</strong> <span id="trustMode"></span></p>
+          <p><strong>State:</strong> <span id="state"></span></p>
+        </article>
+
+        <article class="card">
+          <h2>Signer</h2>
+          <p><strong>Issuer:</strong> <span id="signerIssuer"></span></p>
+          <p><strong>Subject:</strong> <span id="signerSubject"></span></p>
+          <p><strong>Organization:</strong> <span id="signerOrg"></span></p>
+        </article>
+      </div>
+
+      <article class="card">
+        <h2>Warnings</h2>
+        <ul id="warnings"></ul>
+      </article>
+
+      <article class="card">
+        <h2>Actions</h2>
+        <ul id="actions"></ul>
+      </article>
+
+      <article class="card">
+        <h2>Ingredients</h2>
+        <ul id="ingredients"></ul>
+      </article>
+    </section>
+
+    <section class="card">
+      <h2>Export</h2>
+      <div class="actions">
+        <button id="copyJson">Copy JSON</button>
+        <button id="copySummary">Copy Summary</button>
+      </div>
+      <pre id="rawJson" class="mono"></pre>
+    </section>
+  </main>
+  <script src="result.js"></script>
+</body>
+</html>
+

@@ -1,0 +1,17 @@
+[package]
+name = "c2pa-native-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+c2pa-inspector-core = { path = "../../crates/c2pa-inspector-core" }
+native-messaging = { path = "../../crates/native-messaging" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+hex.workspace = true

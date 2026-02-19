@@ -219,3 +219,11 @@ Example direct call:
 ```
 
 Use views-first policies for git whenever possible, and ensure `git` is installed on the host running `mcp-gateway`.
+
+## Browser Extension MVP
+
+Phase 13 adds a Chrome MV3 extension + native messaging host for C2PA inspection:
+- Extension: `extensions/c2pa-inspect`
+- Host binary: `c2pa-native-host`
+
+Installation and host registration instructions are in `docs/EXTENSION.md`.
