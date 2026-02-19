@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sqlparser.workspace = true
+c2pa-inspector-core = { path = "../c2pa-inspector-core" }
 mcp-wire = { path = "../mcp-wire" }
 
 [dev-dependencies]

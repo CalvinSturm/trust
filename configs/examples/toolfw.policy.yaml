@@ -20,3 +20,8 @@ rules:
       mcp_method: "tools/call"
       tool: "files.write"
     decision: require_approval
+
+  - match:
+      mcp_method: "tools/call"
+      tool: "c2pa.inspect"
+    decision: allow

@@ -44,4 +44,18 @@ target/debug/toolfw proxy stdio --policy configs/examples/toolfw.policy.yaml --a
 target/debug/toolfw approve --approval-store ./approval-store.json <approval_request_id>
 ```
 
+## C2PA Inspect
+
+Inspect an asset directly with the CLI:
+
+```bash
+target/debug/c2pa-inspect ./path/to/asset.jpg --json --trust=off
+```
+
+Inspect via MCP through the gateway tool:
+
+```json
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"c2pa.inspect","arguments":{"mount":"notes","path":"asset.jpg","trust":"off"}}}
+```
+
 Edit example config paths before real use.

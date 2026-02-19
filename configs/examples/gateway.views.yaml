@@ -15,3 +15,10 @@ views:
   #     query: "SELECT id, title FROM notes LIMIT 50"
   #     max_rows: 50
   #     max_bytes: 50000
+
+  # - name: signed_asset_cc
+  #   tool: c2pa.inspect
+  #   args:
+  #     mount: notes
+  #     path: "signed.jpg"
+  #     trust: "off"

@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use c2pa_inspector_core::{inspect_path, parse_trust_mode, InspectOptions, TrustMode};
 use mcp_wire::{error, read_json_line_streaming, success, Id};
 use rusqlite::types::ValueRef;
 use rusqlite::OpenFlags;
@@ -167,7 +168,20 @@ fn handle_message(
                         {"name": "files.search"},
                         {"name": "files.write"},
                         {"name": "views.query"},
-                        {"name": "sqlite.query"}
+                        {"name": "sqlite.query"},
+                        {
+                            "name": "c2pa.inspect",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "mount": {"type": "string"},
+                                    "path": {"type": "string"},
+                                    "trust": {"type": "string", "enum": ["off", "default"]}
+                                },
+                                "required": ["mount", "path"],
+                                "additionalProperties": false
+                            }
+                        }
                     ]
                 }),
             ))
@@ -225,6 +239,7 @@ fn call_tool(
         "files.write" => files_write(mounts, &args),
         "files.search" => files_search(mounts, &args),
         "sqlite.query" => sqlite_query(mounts, &args),
+        "c2pa.inspect" => c2pa_inspect(mounts, &args),
         "views.query" => views_query(mounts, views, &args),
         _ => Err(anyhow!("unknown tool")),
     }
@@ -514,9 +529,28 @@ fn views_query(
         "files.search" => files_search(mounts, &view.args)?,
         "files.read" => files_read(mounts, &view.args)?,
         "sqlite.query" => sqlite_query(mounts, &view.args)?,
+        "c2pa.inspect" => c2pa_inspect(mounts, &view.args)?,
         _ => return Err(anyhow!("unsupported view tool")),
     };
     Ok(json!({ "view": view_name, "data": data }))
+}
+
+fn c2pa_inspect(mounts: &HashMap<String, Mount>, args: &Value) -> Result<Value> {
+    let (mount, rel) = mount_and_path(mounts, args)?;
+    let asset_path = resolve_mount_path(&mount.root, &rel, ResolvePurpose::Read)?;
+    let trust = args.get("trust").and_then(Value::as_str).unwrap_or("off");
+    let trust = parse_trust_mode(trust)?;
+    if matches!(trust, TrustMode::CustomPem { .. }) {
+        return Err(anyhow!(
+            "custom trust mode is not allowed for c2pa.inspect via MCP"
+        ));
+    }
+    let opts = InspectOptions {
+        trust,
+        ..InspectOptions::default()
+    };
+    let report = inspect_path(&asset_path, &opts)?;
+    serde_json::to_value(report).context("serialize c2pa report")
 }
 
 fn sqlite_query(mounts: &HashMap<String, Mount>, args: &Value) -> Result<Value> {
