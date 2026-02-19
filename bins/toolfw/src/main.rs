@@ -30,6 +30,8 @@ enum ProxyCommands {
         policy: PathBuf,
         #[arg(long)]
         approval_store: PathBuf,
+        #[arg(long)]
+        audit: Option<PathBuf>,
         #[arg(trailing_var_arg = true, required = true)]
         upstream: Vec<String>,
     },
@@ -43,9 +45,10 @@ fn main() -> Result<()> {
                 ProxyCommands::Stdio {
                     policy,
                     approval_store,
+                    audit,
                     upstream,
                 },
-        } => toolfw_core::run_proxy_stdio(&policy, &approval_store, &upstream),
+        } => toolfw_core::run_proxy_stdio(&policy, &approval_store, audit.as_deref(), &upstream),
         Commands::Approve {
             approval_store,
             approval_request_id,

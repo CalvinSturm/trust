@@ -21,6 +21,7 @@ version = "0.1.0"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+jsonschema = "0.18"
 globset = "0.4"
 hex = "0.4"
 hmac = "0.12"
@@ -35,3 +36,4 @@ tempfile = "3"
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+audit-log = { path = "crates/audit-log" }

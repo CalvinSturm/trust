@@ -11,10 +11,13 @@ use serde_json::{json, Value};
 struct Cli {
     #[arg(long)]
     log: PathBuf,
+    #[arg(long)]
+    tools: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let tools_payload = load_tools_payload(cli.tools.as_deref())?;
 
     let mut stdin = io::stdin().lock();
     let stdout = io::stdout();
@@ -22,7 +25,7 @@ fn main() -> Result<()> {
     let mut partial = Vec::new();
 
     while let Some(msg) = mcp_wire::read_json_line_streaming(&mut stdin, &mut partial)? {
-        if let Some(resp) = handle_message(&cli.log, &msg)? {
+        if let Some(resp) = handle_message(&cli.log, tools_payload.as_ref(), &msg)? {
             mcp_wire::write_json_line(&mut out, &resp)?;
         }
     }
@@ -30,7 +33,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn handle_message(log_path: &PathBuf, msg: &Value) -> Result<Option<Value>> {
+fn handle_message(
+    log_path: &PathBuf,
+    tools_payload: Option<&Value>,
+    msg: &Value,
+) -> Result<Option<Value>> {
     let method = msg
         .get("method")
         .and_then(Value::as_str)
@@ -71,6 +78,16 @@ fn handle_message(log_path: &PathBuf, msg: &Value) -> Result<Option<Value>> {
                 }
             })
         }
+        "tools/list" => {
+            let result = tools_payload
+                .cloned()
+                .unwrap_or_else(|| json!({ "tools": [] }));
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result
+            })
+        }
         _ => json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -88,4 +105,13 @@ fn append_log(path: &PathBuf, value: &Value) -> Result<()> {
     f.write_all(b"\n")?;
     f.flush()?;
     Ok(())
+}
+
+fn load_tools_payload(path: Option<&std::path::Path>) -> Result<Option<Value>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let txt = std::fs::read_to_string(path)?;
+    let value: Value = serde_json::from_str(&txt)?;
+    Ok(Some(value))
 }

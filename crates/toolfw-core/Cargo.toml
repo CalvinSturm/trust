@@ -6,8 +6,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+audit-log = { path = "../audit-log" }
 base64.workspace = true
 hmac.workspace = true
+jsonschema.workspace = true
 mcp-wire = { path = "../mcp-wire" }
 policy-engine = { path = "../policy-engine" }
 rand.workspace = true
