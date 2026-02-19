@@ -39,6 +39,12 @@ pub struct AuditEvent {
     pub result_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args_sample: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_sample: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_data_sample: Option<Value>,
 }
 
 impl AuditEvent {
@@ -55,13 +61,25 @@ impl AuditEvent {
             result_digest: None,
             result_bytes: None,
             error_code: None,
+            args_sample: None,
+            result_sample: None,
+            error_data_sample: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub version: String,
+    pub updated_at: u128,
+    pub entry_count: u64,
+    pub head_hash: String,
 }
 
 struct State {
     file: File,
     prev_hash: String,
+    entries: u64,
 }
 
 pub struct AuditLogger {
@@ -75,7 +93,7 @@ impl AuditLogger {
                 .with_context(|| format!("create audit directory {}", parent.display()))?;
         }
 
-        let prev_hash = load_last_hash(path).unwrap_or_else(|| "0".repeat(64));
+        let (prev_hash, entries) = compute_chain_state(path)?;
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -83,7 +101,11 @@ impl AuditLogger {
             .with_context(|| format!("open audit log {}", path.display()))?;
 
         Ok(Self {
-            state: Mutex::new(State { file, prev_hash }),
+            state: Mutex::new(State {
+                file,
+                prev_hash,
+                entries,
+            }),
         })
     }
 
@@ -117,7 +139,21 @@ impl AuditLogger {
         guard.file.flush().context("flush audit log")?;
 
         guard.prev_hash = hash;
+        guard.entries = guard.entries.saturating_add(1);
         Ok(())
+    }
+
+    pub fn checkpoint(&self) -> Result<Checkpoint> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("audit log mutex poisoned"))?;
+        Ok(Checkpoint {
+            version: "v1".to_string(),
+            updated_at: now_ms(),
+            entry_count: guard.entries,
+            head_hash: guard.prev_hash.clone(),
+        })
     }
 }
 
@@ -159,6 +195,49 @@ pub fn verify_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn write_checkpoint(path: &Path, checkpoint: &Checkpoint) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create checkpoint directory {}", parent.display()))?;
+    }
+
+    let tmp = path.with_extension("tmp");
+    let bytes = serde_json::to_vec_pretty(checkpoint).context("serialize checkpoint")?;
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(|| format!("open checkpoint temp {}", tmp.display()))?;
+        f.write_all(&bytes)
+            .with_context(|| format!("write checkpoint temp {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("sync checkpoint temp {}", tmp.display()))?;
+    }
+    fs::rename(&tmp, path)
+        .with_context(|| format!("replace checkpoint {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+pub fn read_checkpoint(path: &Path) -> Result<Checkpoint> {
+    let txt = fs::read_to_string(path)
+        .with_context(|| format!("read checkpoint file {}", path.display()))?;
+    let c = serde_json::from_str::<Checkpoint>(&txt)
+        .with_context(|| format!("parse checkpoint file {}", path.display()))?;
+    Ok(c)
+}
+
+pub fn verify_with_checkpoint(audit_path: &Path, checkpoint_path: &Path) -> Result<()> {
+    let cp = read_checkpoint(checkpoint_path)?;
+    verify_file(audit_path)?;
+    let (head_hash, entries) = compute_chain_state(audit_path)?;
+    if cp.head_hash != head_hash || cp.entry_count != entries {
+        return Err(anyhow!("checkpoint mismatch"));
+    }
+    Ok(())
+}
+
 pub fn digest_and_size(value: &Value) -> Result<(String, usize)> {
     let bytes = serde_json::to_vec(value).context("serialize digest payload")?;
     let digest = hash_bytes(&bytes);
@@ -172,14 +251,25 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-fn load_last_hash(path: &Path) -> Option<String> {
+fn compute_chain_state(path: &Path) -> Result<(String, u64)> {
     if !path.exists() {
-        return None;
+        return Ok(("0".repeat(64), 0));
     }
-    let txt = fs::read_to_string(path).ok()?;
-    let last = txt.lines().last()?;
-    let v: Value = serde_json::from_str(last).ok()?;
-    v.get("hash")?.as_str().map(|s| s.to_string())
+    let txt =
+        fs::read_to_string(path).with_context(|| format!("read audit log {}", path.display()))?;
+    let mut head = "0".repeat(64);
+    let mut count: u64 = 0;
+    for line in txt.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line).context("parse audit line for state")?;
+        if let Some(h) = v.get("hash").and_then(Value::as_str) {
+            head = h.to_string();
+            count = count.saturating_add(1);
+        }
+    }
+    Ok((head, count))
 }
 
 fn hash_entry(prev_hash: &str, payload: &[u8]) -> String {

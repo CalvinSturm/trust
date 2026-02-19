@@ -6,7 +6,13 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+sqlparser.workspace = true
 mcp-wire = { path = "../mcp-wire" }
+
+[dev-dependencies]
+tempfile.workspace = true

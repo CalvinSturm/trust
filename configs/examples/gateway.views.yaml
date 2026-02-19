@@ -6,3 +6,12 @@ views:
       query: "hello"
       max_results: 10
       max_bytes: 20000
+
+  # - name: notes_sql
+  #   tool: sqlite.query
+  #   args:
+  #     mount: notes
+  #     path: "notes.db"
+  #     query: "SELECT id, title FROM notes LIMIT 50"
+  #     max_rows: 50
+  #     max_bytes: 50000

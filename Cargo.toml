@@ -25,11 +25,14 @@ jsonschema = "0.18"
 globset = "0.4"
 hex = "0.4"
 hmac = "0.12"
+regex = "1"
 rand = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
+sqlparser = "0.51"
 thiserror = "2"
 tempfile = "3"
 
@@ -37,3 +40,4 @@ tempfile = "3"
 serde_json.workspace = true
 tempfile.workspace = true
 audit-log = { path = "crates/audit-log" }
+rusqlite.workspace = true

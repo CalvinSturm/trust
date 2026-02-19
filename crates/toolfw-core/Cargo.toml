@@ -13,6 +13,7 @@ jsonschema.workspace = true
 mcp-wire = { path = "../mcp-wire" }
 policy-engine = { path = "../policy-engine" }
 rand.workspace = true
+redaction = { path = "../redaction" }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

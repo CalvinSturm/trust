@@ -1,12 +1,18 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufWriter};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use mcp_wire::{error, read_json_line_streaming, success, Id};
+use rusqlite::types::ValueRef;
+use rusqlite::OpenFlags;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlparser::ast::Statement;
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -39,6 +45,12 @@ pub struct ViewSpec {
 struct Mount {
     root: PathBuf,
     read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResolvePurpose {
+    Read,
+    Write,
 }
 
 pub fn run_stdio(mounts_path: &Path, views_path: &Path) -> Result<()> {
@@ -154,7 +166,8 @@ fn handle_message(
                         {"name": "files.read"},
                         {"name": "files.search"},
                         {"name": "files.write"},
-                        {"name": "views.query"}
+                        {"name": "views.query"},
+                        {"name": "sqlite.query"}
                     ]
                 }),
             ))
@@ -211,6 +224,7 @@ fn call_tool(
         "files.read" => files_read(mounts, &args),
         "files.write" => files_write(mounts, &args),
         "files.search" => files_search(mounts, &args),
+        "sqlite.query" => sqlite_query(mounts, &args),
         "views.query" => views_query(mounts, views, &args),
         _ => Err(anyhow!("unknown tool")),
     }
@@ -242,39 +256,82 @@ fn ensure_under_root(root: &Path, candidate: &Path) -> Result<()> {
     Ok(())
 }
 
-fn safe_join_existing(root: &Path, rel: &str) -> Result<PathBuf> {
-    let rel_path = PathBuf::from(rel);
-    if rel_path.is_absolute() {
+fn normalize_rel_segments(rel: &str) -> Result<Vec<String>> {
+    let normalized = rel.replace('\\', "/");
+    let path = Path::new(&normalized);
+    if path.is_absolute() {
         return Err(anyhow!("absolute paths are not allowed"));
     }
-    let joined = root.join(&rel_path);
-    let canonical = joined
-        .canonicalize()
-        .with_context(|| format!("canonicalize {}", joined.display()))?;
-    ensure_under_root(root, &canonical)?;
-    Ok(canonical)
+    let mut out = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::Normal(s) => out.push(s.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::ParentDir => return Err(anyhow!("parent segments are not allowed")),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!("absolute paths are not allowed"))
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(anyhow!("empty relative path is not allowed"));
+    }
+    Ok(out)
 }
 
-fn safe_join_for_write(root: &Path, rel: &str) -> Result<PathBuf> {
-    let rel_path = PathBuf::from(rel);
-    if rel_path.is_absolute() {
-        return Err(anyhow!("absolute paths are not allowed"));
+fn resolve_mount_path(root: &Path, rel: &str, purpose: ResolvePurpose) -> Result<PathBuf> {
+    let segments = normalize_rel_segments(rel)?;
+    let mut cursor = root.to_path_buf();
+
+    for (idx, seg) in segments.iter().enumerate() {
+        let is_last = idx + 1 == segments.len();
+        let candidate = cursor.join(seg);
+
+        match fs::symlink_metadata(&candidate) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(anyhow!("symlinks are not allowed in mount paths"));
+                }
+                if !is_last && !meta.is_dir() {
+                    return Err(anyhow!("path component is not a directory"));
+                }
+                if !is_last {
+                    cursor = candidate;
+                    continue;
+                }
+
+                let canonical = candidate
+                    .canonicalize()
+                    .with_context(|| format!("canonicalize {}", candidate.display()))?;
+                ensure_under_root(root, &canonical)?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match purpose {
+                ResolvePurpose::Read => {
+                    return Err(anyhow!("path does not exist"));
+                }
+                ResolvePurpose::Write => {
+                    if !is_last {
+                        fs::create_dir(&candidate).with_context(|| {
+                            format!("create directory segment {}", candidate.display())
+                        })?;
+                        cursor = candidate;
+                        continue;
+                    }
+                    ensure_under_root(root, &candidate)?;
+                    return Ok(candidate);
+                }
+            },
+            Err(e) => return Err(e).with_context(|| format!("stat {}", candidate.display())),
+        }
     }
-    let full = root.join(&rel_path);
-    let parent = full
-        .parent()
-        .ok_or_else(|| anyhow!("invalid destination path"))?;
-    fs::create_dir_all(parent).with_context(|| format!("create parent {}", parent.display()))?;
-    let parent_canonical = parent
-        .canonicalize()
-        .with_context(|| format!("canonicalize parent {}", parent.display()))?;
-    ensure_under_root(root, &parent_canonical)?;
-    Ok(full)
+
+    Err(anyhow!("failed to resolve path"))
 }
 
 fn files_read(mounts: &HashMap<String, Mount>, args: &Value) -> Result<Value> {
     let (mount, rel) = mount_and_path(mounts, args)?;
-    let path = safe_join_existing(&mount.root, &rel)?;
+    let path = resolve_mount_path(&mount.root, &rel, ResolvePurpose::Read)?;
     let content =
         fs::read_to_string(&path).with_context(|| format!("read file {}", path.display()))?;
     Ok(json!({ "content": content }))
@@ -289,7 +346,7 @@ fn files_write(mounts: &HashMap<String, Mount>, args: &Value) -> Result<Value> {
         .get("content")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing content"))?;
-    let dst = safe_join_for_write(&mount.root, &rel)?;
+    let dst = resolve_mount_path(&mount.root, &rel, ResolvePurpose::Write)?;
     fs::write(&dst, content).with_context(|| format!("write file {}", dst.display()))?;
     Ok(json!({ "ok": true, "bytes_written": content.len() }))
 }
@@ -331,6 +388,13 @@ fn files_search(mounts: &HashMap<String, Mount>, args: &Value) -> Result<Value> 
                 Err(_) => continue,
             };
             let p = entry.path();
+            let meta = match fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             if p.is_dir() {
                 pending.push(p);
                 continue;
@@ -377,6 +441,63 @@ fn files_search(mounts: &HashMap<String, Mount>, args: &Value) -> Result<Value> 
     Ok(json!({ "results": results, "truncated": truncated }))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolve_rejects_absolute_path() {
+        let t = tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        let abs = root.join("x.txt").to_string_lossy().to_string();
+        let r = resolve_mount_path(&root, &abs, ResolvePurpose::Read);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn resolve_rejects_parent_segments() {
+        let t = tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        let r = resolve_mount_path(&root, "../escape.txt", ResolvePurpose::Read);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn resolve_write_new_file_under_root_succeeds() {
+        let t = tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        let p = resolve_mount_path(&root, "a/b/new.txt", ResolvePurpose::Write).unwrap();
+        assert!(p.starts_with(&root));
+        assert!(p.ends_with(Path::new("new.txt")));
+    }
+
+    #[test]
+    fn resolve_rejects_symlink_escape_read_and_write() {
+        let t = tempdir().unwrap();
+        let root = t.path().join("root");
+        let outside = t.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let root = root.canonicalize().unwrap();
+        let outside = outside.canonicalize().unwrap();
+        let link = root.join("link");
+
+        #[cfg(windows)]
+        let symlink_ok = std::os::windows::fs::symlink_dir(&outside, &link).is_ok();
+        #[cfg(not(windows))]
+        let symlink_ok = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        if !symlink_ok {
+            return;
+        }
+
+        let read = resolve_mount_path(&root, "link/file.txt", ResolvePurpose::Read);
+        let write = resolve_mount_path(&root, "link/file.txt", ResolvePurpose::Write);
+        assert!(read.is_err());
+        assert!(write.is_err());
+    }
+}
+
 fn views_query(
     mounts: &HashMap<String, Mount>,
     views: &HashMap<String, ViewSpec>,
@@ -392,7 +513,118 @@ fn views_query(
     let data = match view.tool.as_str() {
         "files.search" => files_search(mounts, &view.args)?,
         "files.read" => files_read(mounts, &view.args)?,
+        "sqlite.query" => sqlite_query(mounts, &view.args)?,
         _ => return Err(anyhow!("unsupported view tool")),
     };
     Ok(json!({ "view": view_name, "data": data }))
+}
+
+fn sqlite_query(mounts: &HashMap<String, Mount>, args: &Value) -> Result<Value> {
+    const DEFAULT_MAX_ROWS: usize = 200;
+    const DEFAULT_MAX_BYTES: usize = 200_000;
+    const MAX_BLOB_BYTES: usize = 4096;
+
+    let mount_name = args
+        .get("mount")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing mount"))?;
+    let rel = args
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing path"))?;
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing query"))?;
+    let max_rows = args
+        .get("max_rows")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_MAX_ROWS as u64) as usize;
+    let max_bytes = args
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_MAX_BYTES as u64) as usize;
+
+    let mount = mounts
+        .get(mount_name)
+        .ok_or_else(|| anyhow!("unknown mount {mount_name}"))?;
+    let db_path = resolve_mount_path(&mount.root, rel, ResolvePurpose::Read)?;
+
+    enforce_select_only(query)?;
+
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open sqlite db {}", db_path.display()))?;
+
+    let mut stmt = conn
+        .prepare(query)
+        .with_context(|| format!("prepare sqlite query in {}", db_path.display()))?;
+    let columns = stmt
+        .column_names()
+        .into_iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>();
+
+    let mut rows_out = Vec::new();
+    let mut bytes_used = columns.iter().map(|c| c.len()).sum::<usize>();
+    let mut truncated = false;
+
+    let mut rows = stmt.query([]).context("execute sqlite query")?;
+    while let Some(row) = rows.next().context("iterate sqlite rows")? {
+        if rows_out.len() >= max_rows {
+            truncated = true;
+            break;
+        }
+
+        let mut row_map = serde_json::Map::new();
+        for (idx, col) in columns.iter().enumerate() {
+            let v = match row.get_ref(idx).context("read sqlite column")? {
+                ValueRef::Null => Value::Null,
+                ValueRef::Integer(i) => json!(i),
+                ValueRef::Real(f) => json!(f),
+                ValueRef::Text(t) => Value::String(String::from_utf8_lossy(t).to_string()),
+                ValueRef::Blob(b) => {
+                    if b.len() > MAX_BLOB_BYTES {
+                        truncated = true;
+                        let encoded = BASE64_STANDARD.encode(&b[..MAX_BLOB_BYTES]);
+                        Value::String(format!("{encoded}..."))
+                    } else {
+                        Value::String(BASE64_STANDARD.encode(b))
+                    }
+                }
+            };
+            row_map.insert(col.clone(), v);
+        }
+
+        let row_value = Value::Object(row_map);
+        let row_bytes = serde_json::to_vec(&row_value)
+            .map(|b| b.len())
+            .context("measure sqlite row size")?;
+        if bytes_used + row_bytes > max_bytes {
+            truncated = true;
+            break;
+        }
+        bytes_used += row_bytes;
+        rows_out.push(row_value);
+    }
+
+    Ok(json!({
+        "columns": columns,
+        "rows": rows_out,
+        "truncated": truncated
+    }))
+}
+
+fn enforce_select_only(query: &str) -> Result<()> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, query).context("parse SQL query")?;
+    if statements.len() != 1 {
+        return Err(anyhow!("exactly one SQL statement is required"));
+    }
+    match &statements[0] {
+        Statement::Query(_) => Ok(()),
+        _ => Err(anyhow!("only SELECT-style queries are allowed")),
+    }
 }

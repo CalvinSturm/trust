@@ -7,13 +7,14 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use audit_log::{digest_and_size, AuditEvent, AuditLogger, Direction};
+use audit_log::{digest_and_size, write_checkpoint, AuditEvent, AuditLogger, Direction};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hmac::{Hmac, Mac};
 use jsonschema::JSONSchema;
 use mcp_wire::{error, read_json_line_streaming, Id};
 use policy_engine::{evaluate, parse_policy, Decision, Policy};
 use rand::{distributions::Alphanumeric, Rng};
+use redaction::Redactor;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -102,6 +103,11 @@ impl ApprovalStore {
     }
 }
 
+struct ProxyConfig {
+    redactor: Redactor,
+    audit_sample_bytes: usize,
+}
+
 pub fn issue_approval_token(store_path: &Path, approval_request_id: &str) -> Result<String> {
     with_store_lock(store_path, || {
         let store = ApprovalStore::load_or_init_nolock(store_path)?;
@@ -120,16 +126,31 @@ pub fn run_proxy_stdio(
     policy_path: &Path,
     approval_store_path: &Path,
     audit_path: Option<&Path>,
+    audit_checkpoint_path: Option<&Path>,
+    redact_path: Option<&Path>,
+    audit_payload_sample_bytes: usize,
     upstream_cmd: &[String],
 ) -> Result<()> {
     if upstream_cmd.is_empty() {
         bail!("upstream command is required");
+    }
+    if audit_checkpoint_path.is_some() && audit_path.is_none() {
+        bail!("--audit-checkpoint requires --audit");
     }
 
     let policy = {
         let txt = fs::read_to_string(policy_path)
             .with_context(|| format!("read policy file {}", policy_path.display()))?;
         parse_policy(&txt)?
+    };
+
+    let config = ProxyConfig {
+        redactor: if let Some(path) = redact_path {
+            Redactor::from_yaml(path)?
+        } else {
+            Redactor::new_default()
+        },
+        audit_sample_bytes: audit_payload_sample_bytes,
     };
 
     let audit = if let Some(path) = audit_path {
@@ -171,6 +192,8 @@ pub fn run_proxy_stdio(
             &mut upstream_partial,
             &mut schema_cache,
             audit.as_ref(),
+            audit_checkpoint_path,
+            &config,
             client_msg,
         )? {
             mcp_wire::write_json_line(&mut out, &resp)?;
@@ -193,6 +216,7 @@ struct EvalMeta {
     decision: Option<String>,
     args_digest: Option<String>,
     args_bytes: Option<usize>,
+    args_sample: Option<Value>,
 }
 
 struct EvalOutcome {
@@ -208,6 +232,8 @@ fn process_client_message(
     upstream_partial: &mut Vec<u8>,
     schema_cache: &mut HashMap<String, Value>,
     audit: Option<&AuditLogger>,
+    audit_checkpoint_path: Option<&Path>,
+    config: &ProxyConfig,
     client_msg: Value,
 ) -> Result<Option<Value>> {
     match client_msg {
@@ -216,7 +242,17 @@ fn process_client_message(
             for item in batch {
                 if !item.is_object() {
                     let resp = invalid_request(Value::Null, "Invalid Request");
-                    log_local_error(audit, None, None, None, None, None, -32600);
+                    log_local_error(
+                        audit,
+                        audit_checkpoint_path,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        -32600,
+                        None,
+                    );
                     responses.push(resp);
                     continue;
                 }
@@ -228,6 +264,8 @@ fn process_client_message(
                     upstream_partial,
                     schema_cache,
                     audit,
+                    audit_checkpoint_path,
+                    config,
                     &item,
                 )? {
                     responses.push(resp);
@@ -247,10 +285,22 @@ fn process_client_message(
             upstream_partial,
             schema_cache,
             audit,
+            audit_checkpoint_path,
+            config,
             &client_msg,
         ),
         _ => {
-            log_local_error(audit, None, None, None, None, None, -32600);
+            log_local_error(
+                audit,
+                audit_checkpoint_path,
+                None,
+                None,
+                None,
+                None,
+                None,
+                -32600,
+                None,
+            );
             Ok(Some(invalid_request(Value::Null, "Invalid Request")))
         }
     }
@@ -264,10 +314,12 @@ fn process_single_message(
     upstream_partial: &mut Vec<u8>,
     schema_cache: &mut HashMap<String, Value>,
     audit: Option<&AuditLogger>,
+    audit_checkpoint_path: Option<&Path>,
+    config: &ProxyConfig,
     request: &Value,
 ) -> Result<Option<Value>> {
-    let outcome = evaluate_request(policy, approval_store_path, request, schema_cache)?;
-    log_client_request(audit, &outcome.meta);
+    let outcome = evaluate_request(policy, approval_store_path, request, schema_cache, config)?;
+    log_client_request(audit, audit_checkpoint_path, &outcome.meta);
 
     match outcome.action {
         ProxyAction::Respond(resp) => {
@@ -276,14 +328,17 @@ fn process_single_message(
                 .and_then(|v| v.get("code"))
                 .and_then(Value::as_i64)
                 .unwrap_or(-32000);
+            let error_data_sample = sample_error_data(&resp, config);
             log_local_error(
                 audit,
+                audit_checkpoint_path,
                 outcome.meta.id,
                 outcome.meta.method,
                 outcome.meta.tool,
                 outcome.meta.decision,
                 outcome.meta.args_digest,
                 error_code,
+                error_data_sample,
             );
             Ok(Some(resp))
         }
@@ -299,11 +354,13 @@ fn process_single_message(
 
                 log_upstream_response(
                     audit,
+                    audit_checkpoint_path,
                     outcome.meta.id,
                     outcome.meta.method,
                     outcome.meta.tool,
                     outcome.meta.decision,
                     &upstream_resp,
+                    config,
                 );
 
                 Ok(Some(upstream_resp))
@@ -319,6 +376,7 @@ fn evaluate_request(
     approval_store_path: &Path,
     request: &Value,
     schema_cache: &HashMap<String, Value>,
+    config: &ProxyConfig,
 ) -> Result<EvalOutcome> {
     if !request.is_object() {
         return Ok(EvalOutcome {
@@ -330,6 +388,7 @@ fn evaluate_request(
                 decision: Some("invalid_request".to_string()),
                 args_digest: None,
                 args_bytes: None,
+                args_sample: None,
             },
         });
     }
@@ -351,6 +410,7 @@ fn evaluate_request(
                 decision: Some("allow".to_string()),
                 args_digest: None,
                 args_bytes: None,
+                args_sample: None,
             },
         });
     }
@@ -372,6 +432,7 @@ fn evaluate_request(
                 decision: Some("allow".to_string()),
                 args_digest: None,
                 args_bytes: None,
+                args_sample: None,
             },
         });
     };
@@ -388,18 +449,21 @@ fn evaluate_request(
         .and_then(Value::as_str)
         .map(|s| s.to_string());
 
-    let (args_digest, args_bytes) = params
+    let args_value = params
         .get("arguments")
-        .and_then(|a| digest_and_size(a).ok())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let (args_digest, args_bytes) = digest_and_size(&args_value)
         .map(|(d, b)| (Some(d), Some(b)))
         .unwrap_or((None, None));
+    let args_sample = sample_for_audit(&args_value, config);
 
     let decision = evaluate(policy, &method, &params);
 
     match decision {
         Decision::Allow => {
             if let Some(resp) =
-                validate_tool_arguments(id.clone(), &tool_name, &params, schema_cache)?
+                validate_tool_arguments(id.clone(), &tool_name, &params, schema_cache, config)?
             {
                 return Ok(EvalOutcome {
                     action: ProxyAction::Respond(resp),
@@ -410,6 +474,7 @@ fn evaluate_request(
                         decision: Some("invalid_params".to_string()),
                         args_digest,
                         args_bytes,
+                        args_sample,
                     },
                 });
             }
@@ -422,6 +487,7 @@ fn evaluate_request(
                     decision: Some("allow".to_string()),
                     args_digest,
                     args_bytes,
+                    args_sample,
                 },
             })
         }
@@ -434,15 +500,20 @@ fn evaluate_request(
                 decision: Some("deny".to_string()),
                 args_digest,
                 args_bytes,
+                args_sample,
             },
         }),
         Decision::RequireApproval => {
             let digest = request_digest("tools/call", &params)?;
             if let Some(token) = approval_token {
                 if verify_token(approval_store_path, &token, &digest)? {
-                    if let Some(resp) =
-                        validate_tool_arguments(id.clone(), &tool_name, &params, schema_cache)?
-                    {
+                    if let Some(resp) = validate_tool_arguments(
+                        id.clone(),
+                        &tool_name,
+                        &params,
+                        schema_cache,
+                        config,
+                    )? {
                         return Ok(EvalOutcome {
                             action: ProxyAction::Respond(resp),
                             meta: EvalMeta {
@@ -452,6 +523,7 @@ fn evaluate_request(
                                 decision: Some("invalid_params".to_string()),
                                 args_digest,
                                 args_bytes,
+                                args_sample,
                             },
                         });
                     }
@@ -464,6 +536,7 @@ fn evaluate_request(
                             decision: Some("allowed_with_token".to_string()),
                             args_digest,
                             args_bytes,
+                            args_sample,
                         },
                     });
                 }
@@ -484,6 +557,7 @@ fn evaluate_request(
                     decision: Some("approval_required".to_string()),
                     args_digest,
                     args_bytes,
+                    args_sample,
                 },
             })
         }
@@ -495,6 +569,7 @@ fn validate_tool_arguments(
     tool_name: &Option<String>,
     params: &Value,
     schema_cache: &HashMap<String, Value>,
+    config: &ProxyConfig,
 ) -> Result<Option<Value>> {
     let Some(tool_name) = tool_name else {
         return Ok(None);
@@ -515,7 +590,7 @@ fn validate_tool_arguments(
 
     let errors = match validator.validate(&args) {
         Ok(_) => Vec::new(),
-        Err(errs) => bounded_validation_errors(errs),
+        Err(errs) => bounded_validation_errors(errs, &config.redactor),
     };
     if errors.is_empty() {
         return Ok(None);
@@ -532,7 +607,7 @@ fn validate_tool_arguments(
     )))
 }
 
-fn bounded_validation_errors<I, E>(errors: I) -> Vec<String>
+fn bounded_validation_errors<I, E>(errors: I, redactor: &Redactor) -> Vec<String>
 where
     I: IntoIterator<Item = E>,
     E: ToString,
@@ -541,7 +616,7 @@ where
         .into_iter()
         .take(MAX_VALIDATION_ERRORS)
         .map(|e| {
-            let s = e.to_string();
+            let s = redactor.redact_str(&e.to_string());
             if s.len() > MAX_VALIDATION_MSG_LEN {
                 format!("{}...", &s[..MAX_VALIDATION_MSG_LEN])
             } else {
@@ -570,7 +645,11 @@ fn cache_tool_schemas(upstream_response: &Value, schema_cache: &mut HashMap<Stri
     }
 }
 
-fn log_client_request(audit: Option<&AuditLogger>, meta: &EvalMeta) {
+fn log_client_request(
+    audit: Option<&AuditLogger>,
+    audit_checkpoint_path: Option<&Path>,
+    meta: &EvalMeta,
+) {
     let Some(audit) = audit else {
         return;
     };
@@ -580,17 +659,23 @@ fn log_client_request(audit: Option<&AuditLogger>, meta: &EvalMeta) {
     event.tool = meta.tool.clone();
     event.args_digest = meta.args_digest.clone();
     event.args_bytes = meta.args_bytes;
-    let _ = audit.append(event);
+    event.args_sample = meta.args_sample.clone();
+    if audit.append(event).is_ok() {
+        maybe_write_checkpoint(audit, audit_checkpoint_path);
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_local_error(
     audit: Option<&AuditLogger>,
+    audit_checkpoint_path: Option<&Path>,
     id: Option<Value>,
     method: Option<String>,
     tool: Option<String>,
     decision: Option<String>,
     args_digest: Option<String>,
     error_code: i64,
+    error_data_sample: Option<Value>,
 ) {
     let Some(audit) = audit else {
         return;
@@ -602,16 +687,22 @@ fn log_local_error(
     event.decision = decision;
     event.args_digest = args_digest;
     event.error_code = Some(error_code);
-    let _ = audit.append(event);
+    event.error_data_sample = error_data_sample;
+    if audit.append(event).is_ok() {
+        maybe_write_checkpoint(audit, audit_checkpoint_path);
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_upstream_response(
     audit: Option<&AuditLogger>,
+    audit_checkpoint_path: Option<&Path>,
     id: Option<Value>,
     method: Option<String>,
     tool: Option<String>,
     decision: Option<String>,
     upstream_resp: &Value,
+    config: &ProxyConfig,
 ) {
     let Some(audit) = audit else {
         return;
@@ -631,7 +722,45 @@ fn log_upstream_response(
     if result_bytes > 0 {
         event.result_bytes = Some(result_bytes);
     }
-    let _ = audit.append(event);
+    if config.audit_sample_bytes > 0 {
+        event.result_sample = if let Some(r) = upstream_resp.get("result") {
+            sample_for_audit(r, config)
+        } else if let Some(err_data) = upstream_resp.get("error").and_then(|e| e.get("data")) {
+            sample_for_audit(err_data, config)
+        } else {
+            None
+        };
+    }
+    if audit.append(event).is_ok() {
+        maybe_write_checkpoint(audit, audit_checkpoint_path);
+    }
+}
+
+fn maybe_write_checkpoint(audit: &AuditLogger, audit_checkpoint_path: Option<&Path>) {
+    let Some(path) = audit_checkpoint_path else {
+        return;
+    };
+    if let Ok(cp) = audit.checkpoint() {
+        let _ = write_checkpoint(path, &cp);
+    }
+}
+
+fn sample_for_audit(value: &Value, config: &ProxyConfig) -> Option<Value> {
+    if config.audit_sample_bytes == 0 {
+        return None;
+    }
+    let redacted = config.redactor.redact_json(value);
+    let mut s = serde_json::to_string(&redacted).ok()?;
+    if s.len() > config.audit_sample_bytes {
+        s.truncate(config.audit_sample_bytes);
+        s.push_str("...");
+    }
+    Some(Value::String(s))
+}
+
+fn sample_error_data(resp: &Value, config: &ProxyConfig) -> Option<Value> {
+    let data = resp.get("error").and_then(|e| e.get("data"))?;
+    sample_for_audit(data, config)
 }
 
 fn invalid_request(id: Value, message: &str) -> Value {
@@ -857,7 +986,7 @@ mod tests {
         let validator = JSONSchema::compile(&schema).unwrap();
         let errs = match validator.validate(&args) {
             Ok(_) => Vec::new(),
-            Err(errs) => bounded_validation_errors(errs),
+            Err(errs) => bounded_validation_errors(errs, &Redactor::new_default()),
         };
         assert!(!errs.is_empty());
         assert!(errs.len() <= MAX_VALIDATION_ERRORS);
