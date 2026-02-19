@@ -1,0 +1,10 @@
+[package]
+name = "mcp-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gateway-core = { path = "../../crates/gateway-core" }

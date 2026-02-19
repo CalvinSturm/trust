@@ -1,0 +1,12 @@
+[package]
+name = "fake-upstream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+mcp-wire = { path = "../../crates/mcp-wire" }

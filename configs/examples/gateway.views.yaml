@@ -1,0 +1,8 @@
+views:
+  - name: notes_recent
+    tool: files.search
+    args:
+      mount: notes
+      query: "hello"
+      max_results: 10
+      max_bytes: 20000

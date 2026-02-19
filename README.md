@@ -1,0 +1,47 @@
+# trust-stack
+
+trust-stack is a Rust monorepo MVP showing a gated MCP-like composition path: client test harness -> `toolfw` stdio proxy -> `mcp-gateway` stdio server -> local filesystem mounts and views.
+
+```mermaid
+sequenceDiagram
+    participant C as MCP Client (tests)
+    participant F as toolfw
+    participant G as mcp-gateway
+    participant FS as Local Filesystem
+
+    C->>F: JSON-RPC over stdio
+    F->>F: policy check + optional approval
+    F->>G: forwarded JSON-RPC
+    G->>FS: mounted file ops / view query
+    FS-->>G: bounded data
+    G-->>F: JSON-RPC response
+    F-->>C: JSON-RPC response
+```
+
+## Quickstart
+
+1. Build:
+
+```bash
+cargo build --workspace
+```
+
+2. Run gateway:
+
+```bash
+target/debug/mcp-gateway --mounts configs/examples/gateway.mounts.yaml --views configs/examples/gateway.views.yaml
+```
+
+3. Run proxy in front of gateway:
+
+```bash
+target/debug/toolfw proxy stdio --policy configs/examples/toolfw.policy.yaml --approval-store ./approval-store.json -- target/debug/mcp-gateway --mounts configs/examples/gateway.mounts.yaml --views configs/examples/gateway.views.yaml
+```
+
+4. Approve a request:
+
+```bash
+target/debug/toolfw approve --approval-store ./approval-store.json <approval_request_id>
+```
+
+Edit example config paths before real use.

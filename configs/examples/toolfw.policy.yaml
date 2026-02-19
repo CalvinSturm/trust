@@ -1,0 +1,22 @@
+protocol_version: "2025-06-18"
+defaults:
+  decision: deny
+rules:
+  - match:
+      mcp_method: "tools/call"
+      tool: "views.query"
+      args:
+        view: "notes_recent"
+    decision: allow
+
+  - match:
+      mcp_method: "tools/call"
+      tool: "files.read"
+      args:
+        path_glob: "**/.env"
+    decision: deny
+
+  - match:
+      mcp_method: "tools/call"
+      tool: "files.write"
+    decision: require_approval

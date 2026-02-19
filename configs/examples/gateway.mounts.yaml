@@ -1,0 +1,4 @@
+mounts:
+  - name: notes
+    root: "/ABS/PATH/TO/NOTES"
+    read_only: false
