@@ -24,6 +24,39 @@ The doctor command validates:
 
 It prints a JSON report and exits non-zero if issues are found.
 
+## Gateway Git Tooling
+
+The gateway git tools (`git.status`, `git.log`, `git.diff`, `git.show`, `git.grep`) require the `git` binary on the host.
+
+Security posture for git tools:
+- mount-scoped repo resolution only
+- safe ref/path validation
+- no shell invocation (`Command` args only)
+- bounded output by bytes/lines/entries
+- read-only command set
+
+## Policy Trace
+
+Use trace for short-lived debugging only. Recommended mode is `deny`.
+
+Proxy error trace (deny/approval/rate-limit only):
+
+```bash
+toolfw proxy stdio --policy configs/examples/toolfw.policy.yaml --approval-store ./approval-store.json --policy-trace deny -- <upstream>
+```
+
+Optional audit trace capture for investigations (off by default):
+
+```bash
+toolfw proxy stdio --policy configs/examples/toolfw.policy.yaml --approval-store ./approval-store.json --audit ./audit.jsonl --policy-trace-to-audit deny -- <upstream>
+```
+
+Inspect a single request path:
+
+```bash
+toolfw policy trace --policy configs/examples/toolfw.policy.yaml --request '{"mcp_method":"tools/call","tool":"views.query","args":{"view":"notes_recent"}}'
+```
+
 ## CI Expectations
 
 The CI workflow enforces:

@@ -60,6 +60,12 @@ enum ProxyCommands {
         redact: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         audit_payload_sample_bytes: usize,
+        #[arg(long, default_value = "off", value_parser = ["off", "deny", "all"])]
+        policy_trace: String,
+        #[arg(long, default_value_t = 200)]
+        policy_trace_max_steps: usize,
+        #[arg(long, default_value = "off", value_parser = ["off", "deny", "all"])]
+        policy_trace_to_audit: String,
         #[arg(trailing_var_arg = true, required = true)]
         upstream: Vec<String>,
     },
@@ -102,6 +108,8 @@ enum DoctorCommands {
         redact: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         audit_payload_sample_bytes: usize,
+        #[arg(long, value_parser = ["off", "deny", "all"])]
+        policy_trace: Option<String>,
         #[arg(long)]
         gateway_mounts: Option<PathBuf>,
         #[arg(long)]
@@ -116,6 +124,14 @@ enum PolicyCommands {
         policy: PathBuf,
         #[arg(long)]
         request: String,
+    },
+    Trace {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        request: String,
+        #[arg(long, default_value_t = 200)]
+        max_steps: usize,
     },
     Lint {
         #[arg(long)]
@@ -231,6 +247,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     auth_keys,
                     redact,
                     audit_payload_sample_bytes,
+                    policy_trace,
+                    policy_trace_max_steps,
+                    policy_trace_to_audit,
                     upstream,
                 },
         } => toolfw_core::run_proxy_stdio(
@@ -243,6 +262,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             auth_keys.as_deref(),
             redact.as_deref(),
             audit_payload_sample_bytes,
+            toolfw_core::PolicyTraceMode::parse(&policy_trace)?,
+            policy_trace_max_steps,
+            toolfw_core::PolicyTraceMode::parse(&policy_trace_to_audit)?,
             &upstream,
         ),
         Commands::Approve {
@@ -336,6 +358,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 auth_keys,
                 redact,
                 audit_payload_sample_bytes,
+                policy_trace,
                 gateway_mounts,
                 gateway_views,
             } => {
@@ -350,6 +373,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         auth_keys: auth_keys.as_deref(),
                         redact: redact.as_deref(),
                         audit_payload_sample_bytes,
+                        policy_trace: policy_trace.as_deref(),
                         gateway_mounts: gateway_mounts.as_deref(),
                         gateway_views: gateway_views.as_deref(),
                     })?;
@@ -364,6 +388,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Policy { command } => match command {
             PolicyCommands::Explain { policy, request } => {
                 let out = toolfw_core::policy_explain(&policy, &request)?;
+                println!("{}", serde_json::to_string(&out)?);
+                Ok(())
+            }
+            PolicyCommands::Trace {
+                policy,
+                request,
+                max_steps,
+            } => {
+                let out = toolfw_core::policy_trace(&policy, &request, max_steps)?;
                 println!("{}", serde_json::to_string(&out)?);
                 Ok(())
             }

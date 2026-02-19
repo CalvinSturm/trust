@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     ClientToUpstream,
@@ -36,6 +36,9 @@ pub struct AuditEvent {
     pub rule_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_reasons: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "trace")]
+    pub policy_trace: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args_digest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,6 +76,7 @@ impl AuditEvent {
             decision: None,
             rule_id: None,
             policy_reasons: None,
+            policy_trace: None,
             args_digest: None,
             args_bytes: None,
             result_digest: None,

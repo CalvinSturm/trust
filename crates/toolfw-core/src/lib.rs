@@ -28,7 +28,7 @@ use jsonschema::JSONSchema;
 use mcp_wire::{error, read_json_line_streaming, Id};
 use policy_engine::{
     compile_and_lint, evaluate_with_context, lint_policy, parse_policy, request_from_params,
-    CompiledPolicy, Decision, RequestContext,
+    CompiledPolicy, Decision, DecisionTrace, RequestContext, TraceConfig, TraceStep,
 };
 use rand::{distributions::Alphanumeric, Rng};
 use redaction::Redactor;
@@ -126,6 +126,27 @@ struct ProxyConfig {
     audit_sample_bytes: usize,
     audit_signing_key: Option<SigningKeyFile>,
     auth_keyring: Option<AuthKeyringV1>,
+    policy_trace: PolicyTraceMode,
+    policy_trace_to_audit: PolicyTraceMode,
+    policy_trace_max_steps: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyTraceMode {
+    Off,
+    Deny,
+    All,
+}
+
+impl PolicyTraceMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "off" => Ok(Self::Off),
+            "deny" => Ok(Self::Deny),
+            "all" => Ok(Self::All),
+            _ => bail!("invalid trace mode '{value}', expected one of: off, deny, all"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +160,7 @@ pub struct DoctorProxyStdioOptions<'a> {
     pub auth_keys: Option<&'a Path>,
     pub redact: Option<&'a Path>,
     pub audit_payload_sample_bytes: usize,
+    pub policy_trace: Option<&'a str>,
     pub gateway_mounts: Option<&'a Path>,
     pub gateway_views: Option<&'a Path>,
 }
@@ -158,6 +180,7 @@ pub struct DoctorSummary {
     pub policy_lint_warnings: usize,
     pub auth: String,
     pub audit: String,
+    pub policy_trace: String,
 }
 
 pub fn issue_approval_token(store_path: &Path, approval_request_id: &str) -> Result<String> {
@@ -238,6 +261,44 @@ pub fn policy_explain(policy_path: &Path, request_json: &str) -> Result<Value> {
     }))
 }
 
+pub fn policy_trace(policy_path: &Path, request_json: &str, max_steps: usize) -> Result<Value> {
+    let txt = fs::read_to_string(policy_path)
+        .with_context(|| format!("read policy file {}", policy_path.display()))?;
+    let policy = parse_policy(&txt)?;
+    let compiled = policy.compile()?;
+    let req: ExplainRequestInput =
+        serde_json::from_str(request_json).context("parse trace request json")?;
+    let auth_verified = req.auth_verified.unwrap_or(false);
+    let (eval, trace) = compiled.evaluate_with_context_traced(
+        &policy_engine::PolicyRequest {
+            mcp_method: req.mcp_method,
+            tool: req.tool,
+            args: req.args,
+        },
+        &RequestContext {
+            client_id: if auth_verified { req.client_id } else { None },
+            auth_verified: Some(auth_verified),
+            token_key_id: if auth_verified {
+                req.token_key_id
+            } else {
+                None
+            },
+        },
+        &TraceConfig {
+            enabled: true,
+            max_steps: max_steps.max(1),
+            max_reasons: 10,
+        },
+    );
+
+    Ok(json!({
+        "decision": eval.decision,
+        "rule_id": eval.matched_rule_id,
+        "rule_index": eval.matched_rule_index,
+        "trace": trace,
+    }))
+}
+
 pub fn policy_lint(policy_path: &Path) -> Result<Value> {
     let txt = fs::read_to_string(policy_path)
         .with_context(|| format!("read policy file {}", policy_path.display()))?;
@@ -280,6 +341,7 @@ pub fn doctor_proxy_stdio(opts: &DoctorProxyStdioOptions<'_>) -> Result<DoctorRe
     let mut policy_rules = 0usize;
     let mut lint_errors = 0usize;
     let mut lint_warnings = 0usize;
+    let mut policy_trace = "off".to_string();
 
     if opts.auth_pubkey.is_some() && opts.auth_keys.is_some() {
         issues.push("--auth-pubkey and --auth-keys are mutually exclusive".to_string());
@@ -290,6 +352,12 @@ pub fn doctor_proxy_stdio(opts: &DoctorProxyStdioOptions<'_>) -> Result<DoctorRe
     if opts.audit_signing_key.is_some() && (opts.audit_checkpoint.is_none() || opts.audit.is_none())
     {
         issues.push("--audit-signing-key requires --audit-checkpoint and --audit".to_string());
+    }
+    if let Some(mode) = opts.policy_trace {
+        match PolicyTraceMode::parse(mode) {
+            Ok(_) => policy_trace = mode.to_string(),
+            Err(e) => issues.push(format!("invalid --policy-trace: {e}")),
+        }
     }
 
     match fs::read_to_string(opts.policy) {
@@ -386,6 +454,7 @@ pub fn doctor_proxy_stdio(opts: &DoctorProxyStdioOptions<'_>) -> Result<DoctorRe
             policy_lint_warnings: lint_warnings,
             auth,
             audit,
+            policy_trace,
         },
     })
 }
@@ -624,6 +693,9 @@ pub fn run_proxy_stdio(
     auth_keys_path: Option<&Path>,
     redact_path: Option<&Path>,
     audit_payload_sample_bytes: usize,
+    policy_trace_mode: PolicyTraceMode,
+    policy_trace_max_steps: usize,
+    policy_trace_to_audit: PolicyTraceMode,
     upstream_cmd: &[String],
 ) -> Result<()> {
     if upstream_cmd.is_empty() {
@@ -675,6 +747,9 @@ pub fn run_proxy_stdio(
         } else {
             None
         },
+        policy_trace: policy_trace_mode,
+        policy_trace_to_audit,
+        policy_trace_max_steps: policy_trace_max_steps.max(1),
     };
 
     let audit = if let Some(path) = audit_path {
@@ -750,6 +825,7 @@ struct EvalMeta {
     rule_id: Option<String>,
     rule_index: Option<usize>,
     policy_reasons: Option<Vec<String>>,
+    policy_trace: Option<Value>,
 }
 
 struct EvalOutcome {
@@ -829,6 +905,50 @@ impl RateLimiter {
     }
 }
 
+fn trace_enabled(config: &ProxyConfig) -> bool {
+    config.policy_trace != PolicyTraceMode::Off
+        || config.policy_trace_to_audit != PolicyTraceMode::Off
+}
+
+fn should_attach_trace_to_error(config: &ProxyConfig, code: i64) -> bool {
+    match config.policy_trace {
+        PolicyTraceMode::Off => false,
+        PolicyTraceMode::Deny | PolicyTraceMode::All => {
+            matches!(
+                code,
+                TOOLFW_DENIED | TOOLFW_APPROVAL_REQUIRED | TOOLFW_RATE_LIMITED
+            )
+        }
+    }
+}
+
+fn should_attach_trace_to_audit(
+    config: &ProxyConfig,
+    direction: Direction,
+    error_code: Option<i64>,
+) -> bool {
+    match config.policy_trace_to_audit {
+        PolicyTraceMode::Off => false,
+        PolicyTraceMode::All => true,
+        PolicyTraceMode::Deny => {
+            direction == Direction::LocalError
+                && matches!(
+                    error_code,
+                    Some(TOOLFW_DENIED | TOOLFW_APPROVAL_REQUIRED | TOOLFW_RATE_LIMITED)
+                )
+        }
+    }
+}
+
+fn attach_trace_to_error_data(base: Value, trace: Option<&Value>) -> Value {
+    if trace.is_none() {
+        return base;
+    }
+    let mut obj = base.as_object().cloned().unwrap_or_default();
+    obj.insert("trace".to_string(), trace.cloned().unwrap_or(Value::Null));
+    Value::Object(obj)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_client_message(
     policy: &CompiledPolicy,
@@ -862,6 +982,7 @@ fn process_client_message(
                         None,
                         Some("<unknown>".to_string()),
                         Some(false),
+                        None,
                         None,
                         None,
                         None,
@@ -925,6 +1046,7 @@ fn process_client_message(
                 None,
                 None,
                 None,
+                None,
             );
             Ok(Some(invalid_request(Value::Null, "Invalid Request")))
         }
@@ -981,6 +1103,7 @@ fn process_single_message(
                 outcome.meta.rule_id,
                 outcome.meta.rule_index,
                 outcome.meta.policy_reasons,
+                outcome.meta.policy_trace,
             );
             Ok(Some(resp))
         }
@@ -1009,6 +1132,7 @@ fn process_single_message(
                     outcome.meta.rule_id,
                     outcome.meta.rule_index,
                     outcome.meta.policy_reasons,
+                    outcome.meta.policy_trace,
                     &upstream_resp,
                 );
 
@@ -1046,6 +1170,7 @@ fn evaluate_request(
                 rule_id: None,
                 rule_index: None,
                 policy_reasons: None,
+                policy_trace: None,
             },
         });
     }
@@ -1075,6 +1200,7 @@ fn evaluate_request(
                 rule_id: None,
                 rule_index: None,
                 policy_reasons: None,
+                policy_trace: None,
             },
         });
     }
@@ -1106,6 +1232,7 @@ fn evaluate_request(
                 rule_id: None,
                 rule_index: None,
                 policy_reasons: None,
+                policy_trace: None,
             },
         });
     };
@@ -1130,22 +1257,34 @@ fn evaluate_request(
         .map(|(d, b)| (Some(d), Some(b)))
         .unwrap_or((None, None));
     let args_sample = sample_for_audit(&args_value, config);
-    let eval = policy.evaluate_with_context(
-        &request_from_params(&method, &params),
-        &RequestContext {
-            client_id: if auth_info.auth_verified {
-                auth_info.client_id.clone()
-            } else {
-                None
-            },
-            auth_verified: Some(auth_info.auth_verified),
-            token_key_id: if auth_info.auth_verified {
-                auth_info.token_key_id.clone()
-            } else {
-                None
-            },
+    let policy_req = request_from_params(&method, &params);
+    let policy_ctx = RequestContext {
+        client_id: if auth_info.auth_verified {
+            auth_info.client_id.clone()
+        } else {
+            None
         },
-    );
+        auth_verified: Some(auth_info.auth_verified),
+        token_key_id: if auth_info.auth_verified {
+            auth_info.token_key_id.clone()
+        } else {
+            None
+        },
+    };
+    let (eval, mut trace_obj): (policy_engine::EvalResult, Option<DecisionTrace>) =
+        if trace_enabled(config) {
+            policy.evaluate_with_context_traced(
+                &policy_req,
+                &policy_ctx,
+                &TraceConfig {
+                    enabled: true,
+                    max_steps: config.policy_trace_max_steps,
+                    max_reasons: 10,
+                },
+            )
+        } else {
+            (policy.evaluate_with_context(&policy_req, &policy_ctx), None)
+        };
     let decision = eval.decision.clone();
     let rule_id = eval.matched_rule_id.clone();
     let rule_index = eval.matched_rule_index;
@@ -1175,15 +1314,43 @@ fn evaluate_request(
                 limit.refill_per_sec,
                 now_ms,
             ) {
+                if let (Some(trace), Some(rule_idx)) = (trace_obj.as_mut(), rule_index) {
+                    if trace.steps.len() < config.policy_trace_max_steps {
+                        trace.steps.push(TraceStep::RateLimitChecked {
+                            rule_index: rule_idx,
+                            rule_id: rule_id.clone(),
+                            key: if auth_info.auth_verified {
+                                "client".to_string()
+                            } else {
+                                "<anon>".to_string()
+                            },
+                            allowed: false,
+                            retry_after_ms: Some(retry_after_ms),
+                        });
+                    } else {
+                        trace.truncated = true;
+                    }
+                }
+                let trace_json = trace_obj
+                    .as_ref()
+                    .and_then(|t| serde_json::to_value(t).ok());
+                let err_data = attach_trace_to_error_data(
+                    json!({
+                        "retry_after_ms": retry_after_ms,
+                        "rule_id": rule_id,
+                    }),
+                    if should_attach_trace_to_error(config, TOOLFW_RATE_LIMITED) {
+                        trace_json.as_ref()
+                    } else {
+                        None
+                    },
+                );
                 return Ok(EvalOutcome {
                     action: ProxyAction::Respond(error(
                         id,
                         TOOLFW_RATE_LIMITED,
                         "Rate limited",
-                        Some(json!({
-                            "retry_after_ms": retry_after_ms,
-                            "rule_id": rule_id,
-                        })),
+                        Some(err_data),
                     )),
                     meta: EvalMeta {
                         id: id_value,
@@ -1200,11 +1367,33 @@ fn evaluate_request(
                         rule_id,
                         rule_index,
                         policy_reasons: Some(explain_reasons),
+                        policy_trace: trace_json,
                     },
                 });
             }
+            if let (Some(trace), Some(rule_idx)) = (trace_obj.as_mut(), rule_index) {
+                if trace.steps.len() < config.policy_trace_max_steps {
+                    trace.steps.push(TraceStep::RateLimitChecked {
+                        rule_index: rule_idx,
+                        rule_id: rule_id.clone(),
+                        key: if auth_info.auth_verified {
+                            "client".to_string()
+                        } else {
+                            "<anon>".to_string()
+                        },
+                        allowed: true,
+                        retry_after_ms: None,
+                    });
+                } else {
+                    trace.truncated = true;
+                }
+            }
         }
     }
+
+    let trace_json = trace_obj
+        .as_ref()
+        .and_then(|t| serde_json::to_value(t).ok());
 
     match decision {
         Decision::Allow => {
@@ -1228,6 +1417,7 @@ fn evaluate_request(
                         rule_id: rule_id.clone(),
                         rule_index,
                         policy_reasons: Some(explain_reasons.clone()),
+                        policy_trace: trace_json.clone(),
                     },
                 });
             }
@@ -1248,6 +1438,7 @@ fn evaluate_request(
                     rule_id,
                     rule_index,
                     policy_reasons: Some(explain_reasons),
+                    policy_trace: trace_json,
                 },
             })
         }
@@ -1256,11 +1447,18 @@ fn evaluate_request(
                 id,
                 TOOLFW_DENIED,
                 "Denied by policy",
-                Some(json!({
-                    "rule_id": rule_id,
-                    "rule_index": rule_index,
-                    "reasons": explain_reasons.clone(),
-                })),
+                Some(attach_trace_to_error_data(
+                    json!({
+                        "rule_id": rule_id,
+                        "rule_index": rule_index,
+                        "reasons": explain_reasons.clone(),
+                    }),
+                    if should_attach_trace_to_error(config, TOOLFW_DENIED) {
+                        trace_json.as_ref()
+                    } else {
+                        None
+                    },
+                )),
             )),
             meta: EvalMeta {
                 id: id_value,
@@ -1277,6 +1475,7 @@ fn evaluate_request(
                 rule_id,
                 rule_index,
                 policy_reasons: Some(explain_reasons),
+                policy_trace: trace_json,
             },
         }),
         Decision::RequireApproval => {
@@ -1307,6 +1506,7 @@ fn evaluate_request(
                                 rule_id: rule_id.clone(),
                                 rule_index,
                                 policy_reasons: Some(explain_reasons.clone()),
+                                policy_trace: trace_json.clone(),
                             },
                         });
                     }
@@ -1327,6 +1527,7 @@ fn evaluate_request(
                             rule_id: rule_id.clone(),
                             rule_index,
                             policy_reasons: Some(explain_reasons.clone()),
+                            policy_trace: trace_json.clone(),
                         },
                     });
                 }
@@ -1338,12 +1539,19 @@ fn evaluate_request(
                     id,
                     TOOLFW_APPROVAL_REQUIRED,
                     "Approval required",
-                    Some(json!({
-                        "approval_request_id": approval_request_id,
-                        "rule_id": rule_id,
-                        "rule_index": rule_index,
-                        "reasons": explain_reasons.clone(),
-                    })),
+                    Some(attach_trace_to_error_data(
+                        json!({
+                            "approval_request_id": approval_request_id,
+                            "rule_id": rule_id,
+                            "rule_index": rule_index,
+                            "reasons": explain_reasons.clone(),
+                        }),
+                        if should_attach_trace_to_error(config, TOOLFW_APPROVAL_REQUIRED) {
+                            trace_json.as_ref()
+                        } else {
+                            None
+                        },
+                    )),
                 )),
                 meta: EvalMeta {
                     id: id_value,
@@ -1360,6 +1568,7 @@ fn evaluate_request(
                     rule_id,
                     rule_index,
                     policy_reasons: Some(explain_reasons),
+                    policy_trace: trace_json,
                 },
             })
         }
@@ -1509,6 +1718,9 @@ fn log_client_request(
     event.token_digest = meta.token_digest.clone();
     event.rule_id = meta.rule_id.clone();
     event.policy_reasons = meta.policy_reasons.clone();
+    if should_attach_trace_to_audit(config, Direction::ClientToUpstream, None) {
+        event.policy_trace = meta.policy_trace.clone();
+    }
     if audit.append(event).is_ok() {
         maybe_write_checkpoint_with_signing(audit, audit_checkpoint_path, config);
     }
@@ -1533,6 +1745,7 @@ fn log_local_error(
     rule_id: Option<String>,
     _rule_index: Option<usize>,
     policy_reasons: Option<Vec<String>>,
+    policy_trace: Option<Value>,
 ) {
     let Some(audit) = audit else {
         return;
@@ -1551,6 +1764,9 @@ fn log_local_error(
     event.token_digest = token_digest;
     event.rule_id = rule_id;
     event.policy_reasons = policy_reasons;
+    if should_attach_trace_to_audit(config, Direction::LocalError, Some(error_code)) {
+        event.policy_trace = policy_trace;
+    }
     if audit.append(event).is_ok() {
         maybe_write_checkpoint_with_signing(audit, audit_checkpoint_path, config);
     }
@@ -1572,6 +1788,7 @@ fn log_upstream_response(
     rule_id: Option<String>,
     _rule_index: Option<usize>,
     policy_reasons: Option<Vec<String>>,
+    policy_trace: Option<Value>,
     upstream_resp: &Value,
 ) {
     let Some(audit) = audit else {
@@ -1592,6 +1809,9 @@ fn log_upstream_response(
     event.token_digest = token_digest;
     event.rule_id = rule_id;
     event.policy_reasons = policy_reasons;
+    if should_attach_trace_to_audit(config, Direction::UpstreamToClient, None) {
+        event.policy_trace = policy_trace;
+    }
     if !result_digest.is_empty() {
         event.result_digest = Some(result_digest);
     }

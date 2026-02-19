@@ -76,6 +76,20 @@ rules:
       tool: "c2pa.inspect"
     decision: allow
 
+  # Views-first git access (recommended):
+  # - match:
+  #     mcp_method: "tools/call"
+  #     tool: "views.query"
+  #     args:
+  #       view: "repo_recent_commits"
+  #   decision: allow
+
+  # Direct git tools (tighter with auth + client_id in real policies):
+  # - match:
+  #     mcp_method: "tools/call"
+  #     tool_glob: "git.*"
+  #   decision: allow
+
   # - match:
   #     client_id: "alice"
   #     auth_verified: true

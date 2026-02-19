@@ -182,3 +182,40 @@ Lint a policy (doctor runs this automatically during preflight):
 ```bash
 target/debug/toolfw policy lint --policy configs/examples/toolfw.policy.yaml --json
 ```
+
+## Policy Trace Mode
+
+Trace a single decision from CLI (bounded, no arg values):
+
+```bash
+target/debug/toolfw policy trace --policy configs/examples/toolfw.policy.yaml --request '{"client_id":"alice","auth_verified":true,"mcp_method":"tools/call","tool":"views.query","args":{"view":"notes_recent"}}' --max-steps 200
+```
+
+Enable deny-path trace in proxy error responses:
+
+```bash
+target/debug/toolfw proxy stdio --policy configs/examples/toolfw.policy.yaml --approval-store ./approval-store.json --policy-trace deny -- <upstream>
+```
+
+Optional audit trace capture (off by default):
+
+```bash
+target/debug/toolfw proxy stdio --policy configs/examples/toolfw.policy.yaml --approval-store ./approval-store.json --audit ./audit.jsonl --policy-trace-to-audit deny -- <upstream>
+```
+
+## Git Tools
+
+`mcp-gateway` now exposes bounded, mount-scoped, read-only git tools:
+- `git.status`
+- `git.log`
+- `git.diff`
+- `git.show`
+- `git.grep`
+
+Example direct call:
+
+```json
+{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"git.log","arguments":{"mount":"notes","repo":".","max_commits":20,"max_bytes":120000,"max_lines":2000}}}
+```
+
+Use views-first policies for git whenever possible, and ensure `git` is installed on the host running `mcp-gateway`.

@@ -25,3 +25,19 @@ views:
   #     mount: notes
   #     path: "signed.jpg"
   #     trust: "off"
+
+  # - name: repo_recent_commits
+  #   tool: git.log
+  #   args:
+  #     mount: notes
+  #     repo: "."
+  #     max_commits: 20
+  #     max_bytes: 120000
+  #     max_lines: 2000
+
+  # - name: repo_status
+  #   tool: git.status
+  #   args:
+  #     mount: notes
+  #     repo: "."
+  #     porcelain: true

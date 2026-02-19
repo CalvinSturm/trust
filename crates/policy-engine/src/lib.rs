@@ -122,6 +122,77 @@ pub struct EvalResult {
     pub rate_limit: Option<TokenBucketSpec>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceConfig {
+    pub enabled: bool,
+    pub max_steps: usize,
+    pub max_reasons: usize,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_steps: 200,
+            max_reasons: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionTrace {
+    pub version: u32,
+    pub request_summary: TraceRequestSummary,
+    pub steps: Vec<TraceStep>,
+    pub selected: Option<TraceSelectedRule>,
+    pub precedence: Option<TracePrecedence>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceRequestSummary {
+    pub mcp_method: String,
+    pub tool: Option<String>,
+    pub client_id_present: bool,
+    pub auth_verified: bool,
+    pub args_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum TraceStep {
+    RuleEvaluated {
+        rule_index: usize,
+        rule_id: Option<String>,
+        priority: i64,
+        hard: bool,
+        decision: String,
+        matched: bool,
+        match_failures: Vec<String>,
+    },
+    RateLimitChecked {
+        rule_index: usize,
+        rule_id: Option<String>,
+        key: String,
+        allowed: bool,
+        retry_after_ms: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceSelectedRule {
+    pub rule_index: usize,
+    pub rule_id: Option<String>,
+    pub decision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TracePrecedence {
+    pub hard_deny_applied: bool,
+    pub winning_priority: Option<i64>,
+    pub tie_break: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
@@ -220,41 +291,108 @@ impl Policy {
     }
 
     pub fn evaluate_with_context(&self, req: &Request, ctx: &ContextMatch) -> EvalResult {
+        self.evaluate_with_context_traced(req, ctx, &TraceConfig::default())
+            .0
+    }
+
+    pub fn evaluate_with_context_traced(
+        &self,
+        req: &Request,
+        ctx: &ContextMatch,
+        trace_cfg: &TraceConfig,
+    ) -> (EvalResult, Option<DecisionTrace>) {
         match self.compile() {
-            Ok(c) => c.evaluate_with_context(req, ctx),
-            Err(e) => EvalResult {
-                decision: self.defaults.decision.clone(),
-                matched: false,
-                matched_rule_id: None,
-                matched_rule_index: None,
-                reasons: vec![Reason {
-                    message: format!("policy compile failed: {e}"),
-                }],
-                rate_limit: None,
-            },
+            Ok(c) => c.evaluate_with_context_traced(req, ctx, trace_cfg),
+            Err(e) => (
+                EvalResult {
+                    decision: self.defaults.decision.clone(),
+                    matched: false,
+                    matched_rule_id: None,
+                    matched_rule_index: None,
+                    reasons: vec![Reason {
+                        message: format!("policy compile failed: {e}"),
+                    }],
+                    rate_limit: None,
+                },
+                None,
+            ),
         }
     }
 }
 
 impl CompiledPolicy {
     pub fn evaluate_with_context(&self, req: &Request, ctx: &ContextMatch) -> EvalResult {
+        self.evaluate_with_context_traced(req, ctx, &TraceConfig::default())
+            .0
+    }
+
+    pub fn evaluate_with_context_traced(
+        &self,
+        req: &Request,
+        ctx: &ContextMatch,
+        trace_cfg: &TraceConfig,
+    ) -> (EvalResult, Option<DecisionTrace>) {
+        let trace_enabled = trace_cfg.enabled;
+        let max_steps = trace_cfg.max_steps.max(1);
+        let max_reasons = trace_cfg.max_reasons.max(1);
+        let mut trace = if trace_enabled {
+            Some(DecisionTrace {
+                version: 1,
+                request_summary: trace_request_summary(req, ctx),
+                steps: Vec::new(),
+                selected: None,
+                precedence: None,
+                truncated: false,
+            })
+        } else {
+            None
+        };
+
         let mut matched: Vec<&CompiledRule> = Vec::new();
         for rule in &self.rules {
-            if matches_rule(&rule.matcher, req, ctx) {
+            let mut failures = Vec::new();
+            let did_match =
+                matches_rule_with_failures(&rule.matcher, req, ctx, &mut failures, max_reasons, "");
+            if let Some(t) = trace.as_mut() {
+                push_trace_step(
+                    t,
+                    max_steps,
+                    TraceStep::RuleEvaluated {
+                        rule_index: rule.index,
+                        rule_id: rule.id.clone(),
+                        priority: rule.priority,
+                        hard: rule.hard,
+                        decision: decision_str(&rule.decision).to_string(),
+                        matched: did_match,
+                        match_failures: failures,
+                    },
+                );
+            }
+            if did_match {
                 matched.push(rule);
             }
         }
         if matched.is_empty() {
-            return EvalResult {
-                decision: self.default_decision.clone(),
-                matched: false,
-                matched_rule_id: None,
-                matched_rule_index: None,
-                reasons: vec![Reason {
-                    message: "no rule matched; default applied".to_string(),
-                }],
-                rate_limit: None,
-            };
+            if let Some(t) = trace.as_mut() {
+                t.precedence = Some(TracePrecedence {
+                    hard_deny_applied: false,
+                    winning_priority: None,
+                    tie_break: None,
+                });
+            }
+            return (
+                EvalResult {
+                    decision: self.default_decision.clone(),
+                    matched: false,
+                    matched_rule_id: None,
+                    matched_rule_index: None,
+                    reasons: vec![Reason {
+                        message: "no rule matched; default applied".to_string(),
+                    }],
+                    rate_limit: None,
+                },
+                trace,
+            );
         }
         let hard = matched
             .iter()
@@ -268,6 +406,11 @@ impl CompiledPolicy {
                 .max_by_key(|r| (r.priority, -(r.index as i64)))
                 .expect("matched non-empty")
         };
+        let tie_break = matched
+            .iter()
+            .filter(|r| r.priority == chosen.priority)
+            .count()
+            > 1;
         let mut reasons = vec![Reason {
             message: format!(
                 "matched rule index={} priority={}",
@@ -279,14 +422,33 @@ impl CompiledPolicy {
                 message: "hard deny takes precedence".to_string(),
             });
         }
-        EvalResult {
-            decision: chosen.decision.clone(),
-            matched: true,
-            matched_rule_id: chosen.id.clone(),
-            matched_rule_index: Some(chosen.index),
-            reasons,
-            rate_limit: chosen.limit.clone(),
+        if let Some(t) = trace.as_mut() {
+            t.selected = Some(TraceSelectedRule {
+                rule_index: chosen.index,
+                rule_id: chosen.id.clone(),
+                decision: decision_str(&chosen.decision).to_string(),
+            });
+            t.precedence = Some(TracePrecedence {
+                hard_deny_applied: hard.is_some(),
+                winning_priority: Some(chosen.priority),
+                tie_break: if tie_break {
+                    Some("file_order".to_string())
+                } else {
+                    None
+                },
+            });
         }
+        (
+            EvalResult {
+                decision: chosen.decision.clone(),
+                matched: true,
+                matched_rule_id: chosen.id.clone(),
+                matched_rule_index: Some(chosen.index),
+                reasons,
+                rate_limit: chosen.limit.clone(),
+            },
+            trace,
+        )
     }
 }
 
@@ -310,6 +472,15 @@ pub fn request_from_params(method: &str, params: &Value) -> PolicyRequest {
 
 pub fn evaluate_with_context(policy: &Policy, req: &Request, ctx: &ContextMatch) -> EvalResult {
     policy.evaluate_with_context(req, ctx)
+}
+
+pub fn evaluate_with_context_traced(
+    policy: &Policy,
+    req: &Request,
+    ctx: &ContextMatch,
+    trace_cfg: &TraceConfig,
+) -> (EvalResult, Option<DecisionTrace>) {
+    policy.evaluate_with_context_traced(req, ctx, trace_cfg)
 }
 
 pub fn lint_policy(policy: &Policy) -> LintReport {
@@ -545,42 +716,57 @@ fn compile_arg(spec: &ArgMatcher, idx: usize, rid: Option<&str>, path: &str) -> 
     Ok(out)
 }
 
-fn matches_rule(m: &CompiledMatch, req: &Request, ctx: &ContextMatch) -> bool {
+fn matches_rule_with_failures(
+    m: &CompiledMatch,
+    req: &Request,
+    ctx: &ContextMatch,
+    failures: &mut Vec<String>,
+    max_failures: usize,
+    prefix: &str,
+) -> bool {
     if let Some(c) = &m.client_id {
         if ctx.client_id.as_deref() != Some(c.as_str()) {
+            push_failure(failures, max_failures, format!("{prefix}client_id"));
             return false;
         }
     }
     if let Some(v) = m.auth_verified {
         if ctx.auth_verified != Some(v) {
+            push_failure(failures, max_failures, format!("{prefix}auth_verified"));
             return false;
         }
     }
     if let Some(k) = &m.token_key_id {
         if ctx.token_key_id.as_deref() != Some(k.as_str()) {
+            push_failure(failures, max_failures, format!("{prefix}token_key_id"));
             return false;
         }
     }
     if let Some(mm) = &m.mcp_method {
         if mm != &req.mcp_method {
+            push_failure(failures, max_failures, format!("{prefix}mcp_method"));
             return false;
         }
     }
     if let Some(g) = &m.mcp_method_glob {
         if !matches_glob(g, &req.mcp_method) {
+            push_failure(failures, max_failures, format!("{prefix}mcp_method_glob"));
             return false;
         }
     }
     if let Some(t) = &m.tool {
         if req.tool.as_deref() != Some(t.as_str()) {
+            push_failure(failures, max_failures, format!("{prefix}tool"));
             return false;
         }
     }
     if let Some(g) = &m.tool_glob {
         let Some(t) = req.tool.as_deref() else {
+            push_failure(failures, max_failures, format!("{prefix}tool_glob"));
             return false;
         };
         if !matches_glob(g, t) {
+            push_failure(failures, max_failures, format!("{prefix}tool_glob"));
             return false;
         }
     }
@@ -588,16 +774,74 @@ fn matches_rule(m: &CompiledMatch, req: &Request, ctx: &ContextMatch) -> bool {
         let target = req.args.get(k).cloned().unwrap_or(Value::Null);
         for c in cons {
             if !matches_arg(c, &target) {
+                push_failure(
+                    failures,
+                    max_failures,
+                    format!("{prefix}args.{k}.{}", carg_kind(c)),
+                );
                 return false;
             }
         }
     }
     if let Some(n) = &m.not {
-        if matches_rule(n, req, ctx) {
+        if matches_rule_with_failures(n, req, ctx, &mut Vec::new(), 0, "not.") {
+            push_failure(failures, max_failures, format!("{prefix}not"));
             return false;
         }
     }
     true
+}
+
+fn push_failure(failures: &mut Vec<String>, max_failures: usize, field: String) {
+    if max_failures == 0 || failures.len() >= max_failures {
+        return;
+    }
+    failures.push(field);
+}
+
+fn carg_kind(c: &CArg) -> &'static str {
+    match c {
+        CArg::Exact(_) => "exact",
+        CArg::Glob(_) => "glob",
+        CArg::Regex(_) => "regex",
+        CArg::Contains(_) => "contains",
+        CArg::Range { .. } => "range",
+    }
+}
+
+fn decision_str(d: &Decision) -> &'static str {
+    match d {
+        Decision::Allow => "allow",
+        Decision::Deny => "deny",
+        Decision::RequireApproval => "require_approval",
+    }
+}
+
+fn trace_request_summary(req: &Request, ctx: &ContextMatch) -> TraceRequestSummary {
+    let mut args_keys = req
+        .args
+        .as_object()
+        .map(|m| m.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    args_keys.sort();
+    if args_keys.len() > 50 {
+        args_keys.truncate(50);
+    }
+    TraceRequestSummary {
+        mcp_method: req.mcp_method.clone(),
+        tool: req.tool.clone(),
+        client_id_present: ctx.client_id.is_some(),
+        auth_verified: ctx.auth_verified.unwrap_or(false),
+        args_keys,
+    }
+}
+
+fn push_trace_step(trace: &mut DecisionTrace, max_steps: usize, step: TraceStep) {
+    if trace.steps.len() >= max_steps {
+        trace.truncated = true;
+        return;
+    }
+    trace.steps.push(step);
 }
 
 fn matches_arg(c: &CArg, target: &Value) -> bool {
@@ -1082,5 +1326,94 @@ rules:
         .unwrap();
         let lint = lint_policy(&policy);
         assert!(lint.warnings.iter().any(|d| d.code == "rule.shadowed"));
+    }
+
+    #[test]
+    fn trace_selected_rule_and_privacy() {
+        let policy = parse_policy(
+            r#"
+protocol_version: "2025-06-18"
+defaults: { decision: deny }
+rules:
+  - id: deny_alice_write
+    priority: 50
+    match:
+      client_id: "alice"
+      tool: "files.write"
+      args:
+        path: { glob: "**/.env" }
+    decision: deny
+"#,
+        )
+        .unwrap();
+        let compiled = policy.compile().unwrap();
+        let req = PolicyRequest {
+            mcp_method: "tools/call".to_string(),
+            tool: Some("files.write".to_string()),
+            args: serde_json::json!({
+                "path": ".env",
+                "content": "SUPER_SECRET_SHOULD_NOT_APPEAR"
+            }),
+        };
+        let (eval, trace) = compiled.evaluate_with_context_traced(
+            &req,
+            &RequestContext {
+                client_id: Some("alice".to_string()),
+                auth_verified: Some(true),
+                token_key_id: None,
+            },
+            &TraceConfig {
+                enabled: true,
+                max_steps: 200,
+                max_reasons: 10,
+            },
+        );
+        assert_eq!(eval.decision, Decision::Deny);
+        let trace = trace.expect("trace enabled");
+        assert_eq!(trace.version, 1);
+        assert_eq!(
+            trace.selected.as_ref().and_then(|s| s.rule_id.clone()),
+            Some("deny_alice_write".to_string())
+        );
+        let serialized = serde_json::to_string(&trace).unwrap();
+        assert!(!serialized.contains("SUPER_SECRET_SHOULD_NOT_APPEAR"));
+        assert!(!serialized.contains(".env"));
+    }
+
+    #[test]
+    fn trace_truncation_is_deterministic() {
+        let mut rules = String::new();
+        for i in 0..8 {
+            rules.push_str(&format!(
+                r#"
+  - id: r{i}
+    match: {{ tool: "files.read" }}
+    decision: deny
+"#
+            ));
+        }
+        let src = format!(
+            r#"
+protocol_version: "2025-06-18"
+defaults: {{ decision: allow }}
+rules:
+{rules}
+"#
+        );
+        let policy = parse_policy(&src).unwrap();
+        let compiled = policy.compile().unwrap();
+        let req = req("files.read", serde_json::json!({"path":"a.txt"}));
+        let (_, trace) = compiled.evaluate_with_context_traced(
+            &req,
+            &RequestContext::default(),
+            &TraceConfig {
+                enabled: true,
+                max_steps: 3,
+                max_reasons: 5,
+            },
+        );
+        let trace = trace.unwrap();
+        assert_eq!(trace.steps.len(), 3);
+        assert!(trace.truncated);
     }
 }
