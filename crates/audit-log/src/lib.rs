@@ -4,7 +4,10 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -74,6 +77,34 @@ pub struct Checkpoint {
     pub updated_at: u128,
     pub entry_count: u64,
     pub head_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigningKeyFile {
+    pub version: u32,
+    pub key_type: String,
+    pub public_key_b64: String,
+    pub secret_key_b64: String,
+    pub key_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedCheckpoint {
+    pub version: u32,
+    pub updated_at: u128,
+    pub entry_count: u64,
+    pub head_hash: String,
+    pub key_id: String,
+    pub signature_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SignedCheckpointPayload {
+    version: u32,
+    updated_at: u128,
+    entry_count: u64,
+    head_hash: String,
+    key_id: String,
 }
 
 struct State {
@@ -196,13 +227,148 @@ pub fn verify_file(path: &Path) -> Result<()> {
 }
 
 pub fn write_checkpoint(path: &Path, checkpoint: &Checkpoint) -> Result<()> {
+    write_json_atomic(
+        path,
+        &serde_json::to_vec_pretty(checkpoint).context("serialize checkpoint")?,
+    )
+}
+
+pub fn generate_signing_key() -> SigningKeyFile {
+    let mut rng = OsRng;
+    let signing_key = SigningKey::generate(&mut rng);
+    let verifying_key = signing_key.verifying_key();
+    let public = verifying_key.to_bytes();
+
+    SigningKeyFile {
+        version: 1,
+        key_type: "ed25519".to_string(),
+        public_key_b64: BASE64_STANDARD.encode(public),
+        secret_key_b64: BASE64_STANDARD.encode(signing_key.to_bytes()),
+        key_id: hash_bytes(public.as_ref()),
+    }
+}
+
+pub fn load_signing_key(path: &Path) -> Result<SigningKeyFile> {
+    let txt = fs::read_to_string(path)
+        .with_context(|| format!("read signing key file {}", path.display()))?;
+    let key: SigningKeyFile = serde_json::from_str(&txt)
+        .with_context(|| format!("parse signing key file {}", path.display()))?;
+    validate_signing_key(&key)?;
+    Ok(key)
+}
+
+pub fn write_signing_key_atomic(path: &Path, key: &SigningKeyFile) -> Result<()> {
+    validate_signing_key(key)?;
+    write_json_atomic(
+        path,
+        &serde_json::to_vec_pretty(key).context("serialize signing key")?,
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+pub fn sign_checkpoint(payload: &Checkpoint, key: &SigningKeyFile) -> Result<SignedCheckpoint> {
+    validate_signing_key(key)?;
+    let signing_key = signing_key_from_file(key)?;
+    let cp_payload = SignedCheckpointPayload {
+        version: 1,
+        updated_at: payload.updated_at,
+        entry_count: payload.entry_count,
+        head_hash: payload.head_hash.clone(),
+        key_id: key.key_id.clone(),
+    };
+    let to_sign = serde_json::to_vec(&cp_payload).context("serialize checkpoint payload")?;
+    let sig = signing_key.sign(&to_sign);
+    Ok(SignedCheckpoint {
+        version: cp_payload.version,
+        updated_at: cp_payload.updated_at,
+        entry_count: cp_payload.entry_count,
+        head_hash: cp_payload.head_hash,
+        key_id: cp_payload.key_id,
+        signature_b64: BASE64_STANDARD.encode(sig.to_bytes()),
+    })
+}
+
+pub fn verify_signed_checkpoint(cp: &SignedCheckpoint, public_key_b64: &str) -> Result<()> {
+    let public = BASE64_STANDARD
+        .decode(public_key_b64.as_bytes())
+        .context("decode public key base64")?;
+    if public.len() != 32 {
+        bail!("public key must be 32 bytes");
+    }
+    let mut public_arr = [0u8; 32];
+    public_arr.copy_from_slice(&public);
+    let verifying_key = VerifyingKey::from_bytes(&public_arr).context("parse public key")?;
+    let expected_key_id = hash_bytes(&public);
+    if cp.key_id != expected_key_id {
+        bail!("checkpoint key_id does not match verification key");
+    }
+
+    let sig_bytes = BASE64_STANDARD
+        .decode(cp.signature_b64.as_bytes())
+        .context("decode checkpoint signature")?;
+    if sig_bytes.len() != 64 {
+        bail!("signature must be 64 bytes");
+    }
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&sig_bytes);
+    let sig = Signature::from_bytes(&sig_arr);
+
+    let payload = SignedCheckpointPayload {
+        version: cp.version,
+        updated_at: cp.updated_at,
+        entry_count: cp.entry_count,
+        head_hash: cp.head_hash.clone(),
+        key_id: cp.key_id.clone(),
+    };
+    let signed = serde_json::to_vec(&payload).context("serialize signed checkpoint payload")?;
+    verifying_key
+        .verify(&signed, &sig)
+        .context("verify checkpoint signature")?;
+    Ok(())
+}
+
+pub fn write_signed_checkpoint_atomic(path: &Path, cp: &SignedCheckpoint) -> Result<()> {
+    write_json_atomic(
+        path,
+        &serde_json::to_vec_pretty(cp).context("serialize signed checkpoint")?,
+    )
+}
+
+pub fn read_signed_checkpoint(path: &Path) -> Result<SignedCheckpoint> {
+    let txt = fs::read_to_string(path)
+        .with_context(|| format!("read signed checkpoint file {}", path.display()))?;
+    serde_json::from_str::<SignedCheckpoint>(&txt)
+        .with_context(|| format!("parse signed checkpoint file {}", path.display()))
+}
+
+pub fn verify_with_signed_checkpoint(
+    audit_path: &Path,
+    signed_checkpoint_path: &Path,
+    public_key_path: &Path,
+) -> Result<()> {
+    verify_file(audit_path)?;
+    let (head_hash, entries) = compute_chain_state(audit_path)?;
+    let cp = read_signed_checkpoint(signed_checkpoint_path)?;
+    if cp.head_hash != head_hash || cp.entry_count != entries {
+        return Err(anyhow!("checkpoint mismatch"));
+    }
+    let public_key_b64 = load_public_key_b64(public_key_path)?;
+    verify_signed_checkpoint(&cp, &public_key_b64)?;
+    Ok(())
+}
+
+fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create checkpoint directory {}", parent.display()))?;
     }
 
     let tmp = path.with_extension("tmp");
-    let bytes = serde_json::to_vec_pretty(checkpoint).context("serialize checkpoint")?;
     {
         let mut f = OpenOptions::new()
             .create(true)
@@ -236,6 +402,62 @@ pub fn verify_with_checkpoint(audit_path: &Path, checkpoint_path: &Path) -> Resu
         return Err(anyhow!("checkpoint mismatch"));
     }
     Ok(())
+}
+
+fn load_public_key_b64(path: &Path) -> Result<String> {
+    let txt = fs::read_to_string(path)
+        .with_context(|| format!("read public key file {}", path.display()))?;
+    let trimmed = txt.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(keyfile) = serde_json::from_str::<SigningKeyFile>(trimmed) {
+            validate_signing_key(&keyfile)?;
+            return Ok(keyfile.public_key_b64);
+        }
+        let v: Value = serde_json::from_str(trimmed)
+            .with_context(|| format!("parse public key json {}", path.display()))?;
+        if let Some(pk) = v.get("public_key_b64").and_then(Value::as_str) {
+            return Ok(pk.to_string());
+        }
+        bail!("public key json missing public_key_b64");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_signing_key(key: &SigningKeyFile) -> Result<()> {
+    if key.version != 1 {
+        bail!("unsupported signing key version {}", key.version);
+    }
+    if key.key_type != "ed25519" {
+        bail!("unsupported signing key type {}", key.key_type);
+    }
+    let public = BASE64_STANDARD
+        .decode(key.public_key_b64.as_bytes())
+        .context("decode public_key_b64")?;
+    if public.len() != 32 {
+        bail!("public key must be 32 bytes");
+    }
+    let secret = BASE64_STANDARD
+        .decode(key.secret_key_b64.as_bytes())
+        .context("decode secret_key_b64")?;
+    if secret.len() != 32 {
+        bail!("secret key must be 32 bytes");
+    }
+    if hash_bytes(&public) != key.key_id {
+        bail!("key_id does not match public key");
+    }
+    Ok(())
+}
+
+fn signing_key_from_file(key: &SigningKeyFile) -> Result<SigningKey> {
+    let secret = BASE64_STANDARD
+        .decode(key.secret_key_b64.as_bytes())
+        .context("decode secret key")?;
+    if secret.len() != 32 {
+        bail!("secret key must be 32 bytes");
+    }
+    let mut sk = [0u8; 32];
+    sk.copy_from_slice(&secret);
+    Ok(SigningKey::from_bytes(&sk))
 }
 
 pub fn digest_and_size(value: &Value) -> Result<(String, usize)> {
@@ -341,5 +563,34 @@ mod tests {
         fs::write(&p, lines.join("\n") + "\n").unwrap();
 
         assert!(verify_file(&p).is_err());
+    }
+
+    #[test]
+    fn signed_checkpoint_roundtrip_and_deterministic() {
+        let key = generate_signing_key();
+        let cp = Checkpoint {
+            version: "v1".to_string(),
+            updated_at: 123,
+            entry_count: 2,
+            head_hash: "ab".repeat(32),
+        };
+        let s1 = sign_checkpoint(&cp, &key).unwrap();
+        let s2 = sign_checkpoint(&cp, &key).unwrap();
+        assert_eq!(s1.signature_b64, s2.signature_b64);
+        verify_signed_checkpoint(&s1, &key.public_key_b64).unwrap();
+    }
+
+    #[test]
+    fn signed_checkpoint_tamper_fails_verification() {
+        let key = generate_signing_key();
+        let cp = Checkpoint {
+            version: "v1".to_string(),
+            updated_at: 123,
+            entry_count: 2,
+            head_hash: "ab".repeat(32),
+        };
+        let mut signed = sign_checkpoint(&cp, &key).unwrap();
+        signed.head_hash = "cd".repeat(32);
+        assert!(verify_signed_checkpoint(&signed, &key.public_key_b64).is_err());
     }
 }

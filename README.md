@@ -44,6 +44,26 @@ target/debug/toolfw proxy stdio --policy configs/examples/toolfw.policy.yaml --a
 target/debug/toolfw approve --approval-store ./approval-store.json <approval_request_id>
 ```
 
+## Audit Verification
+
+Generate an audit signing key (prints public key to stdout):
+
+```bash
+target/debug/toolfw audit keygen --out ./audit-signing-key.json
+```
+
+Run proxy with signed checkpoints:
+
+```bash
+target/debug/toolfw proxy stdio --policy configs/examples/toolfw.policy.yaml --approval-store ./approval-store.json --audit ./audit.jsonl --audit-checkpoint ./audit.checkpoint.json --audit-signing-key ./audit-signing-key.json -- target/debug/mcp-gateway --mounts configs/examples/gateway.mounts.yaml --views configs/examples/gateway.views.yaml
+```
+
+Verify audit integrity:
+
+```bash
+target/debug/toolfw audit verify --audit ./audit.jsonl --checkpoint ./audit.checkpoint.json --pubkey ./audit-signing-key.json
+```
+
 ## C2PA Inspect
 
 Inspect an asset directly with the CLI:

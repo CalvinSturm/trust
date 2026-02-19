@@ -7,7 +7,11 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use audit_log::{digest_and_size, write_checkpoint, AuditEvent, AuditLogger, Direction};
+use audit_log::{
+    digest_and_size, generate_signing_key, load_signing_key, sign_checkpoint,
+    verify_with_checkpoint, verify_with_signed_checkpoint, write_checkpoint,
+    write_signed_checkpoint_atomic, AuditEvent, AuditLogger, Direction, SigningKeyFile,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hmac::{Hmac, Mac};
 use jsonschema::JSONSchema;
@@ -106,6 +110,7 @@ impl ApprovalStore {
 struct ProxyConfig {
     redactor: Redactor,
     audit_sample_bytes: usize,
+    audit_signing_key: Option<SigningKeyFile>,
 }
 
 pub fn issue_approval_token(store_path: &Path, approval_request_id: &str) -> Result<String> {
@@ -122,11 +127,31 @@ pub fn issue_approval_token(store_path: &Path, approval_request_id: &str) -> Res
     })
 }
 
+pub fn audit_keygen(out_path: &Path) -> Result<String> {
+    let key = generate_signing_key();
+    audit_log::write_signing_key_atomic(out_path, &key)?;
+    Ok(key.public_key_b64)
+}
+
+pub fn audit_verify(audit_path: &Path, checkpoint_path: &Path, pubkey_path: &Path) -> Result<()> {
+    let txt = fs::read_to_string(checkpoint_path)
+        .with_context(|| format!("read checkpoint {}", checkpoint_path.display()))?;
+    let v: Value = serde_json::from_str(&txt)
+        .with_context(|| format!("parse checkpoint {}", checkpoint_path.display()))?;
+    let is_signed = v.get("signature_b64").and_then(Value::as_str).is_some();
+    if is_signed {
+        verify_with_signed_checkpoint(audit_path, checkpoint_path, pubkey_path)
+    } else {
+        verify_with_checkpoint(audit_path, checkpoint_path)
+    }
+}
+
 pub fn run_proxy_stdio(
     policy_path: &Path,
     approval_store_path: &Path,
     audit_path: Option<&Path>,
     audit_checkpoint_path: Option<&Path>,
+    audit_signing_key_path: Option<&Path>,
     redact_path: Option<&Path>,
     audit_payload_sample_bytes: usize,
     upstream_cmd: &[String],
@@ -136,6 +161,9 @@ pub fn run_proxy_stdio(
     }
     if audit_checkpoint_path.is_some() && audit_path.is_none() {
         bail!("--audit-checkpoint requires --audit");
+    }
+    if audit_signing_key_path.is_some() && audit_checkpoint_path.is_none() {
+        bail!("--audit-signing-key requires --audit-checkpoint");
     }
 
     let policy = {
@@ -151,6 +179,11 @@ pub fn run_proxy_stdio(
             Redactor::new_default()
         },
         audit_sample_bytes: audit_payload_sample_bytes,
+        audit_signing_key: if let Some(path) = audit_signing_key_path {
+            Some(load_signing_key(path)?)
+        } else {
+            None
+        },
     };
 
     let audit = if let Some(path) = audit_path {
@@ -245,6 +278,7 @@ fn process_client_message(
                     log_local_error(
                         audit,
                         audit_checkpoint_path,
+                        config,
                         None,
                         None,
                         None,
@@ -293,6 +327,7 @@ fn process_client_message(
             log_local_error(
                 audit,
                 audit_checkpoint_path,
+                config,
                 None,
                 None,
                 None,
@@ -319,7 +354,7 @@ fn process_single_message(
     request: &Value,
 ) -> Result<Option<Value>> {
     let outcome = evaluate_request(policy, approval_store_path, request, schema_cache, config)?;
-    log_client_request(audit, audit_checkpoint_path, &outcome.meta);
+    log_client_request(audit, audit_checkpoint_path, config, &outcome.meta);
 
     match outcome.action {
         ProxyAction::Respond(resp) => {
@@ -332,6 +367,7 @@ fn process_single_message(
             log_local_error(
                 audit,
                 audit_checkpoint_path,
+                config,
                 outcome.meta.id,
                 outcome.meta.method,
                 outcome.meta.tool,
@@ -355,12 +391,12 @@ fn process_single_message(
                 log_upstream_response(
                     audit,
                     audit_checkpoint_path,
+                    config,
                     outcome.meta.id,
                     outcome.meta.method,
                     outcome.meta.tool,
                     outcome.meta.decision,
                     &upstream_resp,
-                    config,
                 );
 
                 Ok(Some(upstream_resp))
@@ -648,6 +684,7 @@ fn cache_tool_schemas(upstream_response: &Value, schema_cache: &mut HashMap<Stri
 fn log_client_request(
     audit: Option<&AuditLogger>,
     audit_checkpoint_path: Option<&Path>,
+    config: &ProxyConfig,
     meta: &EvalMeta,
 ) {
     let Some(audit) = audit else {
@@ -661,7 +698,7 @@ fn log_client_request(
     event.args_bytes = meta.args_bytes;
     event.args_sample = meta.args_sample.clone();
     if audit.append(event).is_ok() {
-        maybe_write_checkpoint(audit, audit_checkpoint_path);
+        maybe_write_checkpoint_with_signing(audit, audit_checkpoint_path, config);
     }
 }
 
@@ -669,6 +706,7 @@ fn log_client_request(
 fn log_local_error(
     audit: Option<&AuditLogger>,
     audit_checkpoint_path: Option<&Path>,
+    config: &ProxyConfig,
     id: Option<Value>,
     method: Option<String>,
     tool: Option<String>,
@@ -689,7 +727,7 @@ fn log_local_error(
     event.error_code = Some(error_code);
     event.error_data_sample = error_data_sample;
     if audit.append(event).is_ok() {
-        maybe_write_checkpoint(audit, audit_checkpoint_path);
+        maybe_write_checkpoint_with_signing(audit, audit_checkpoint_path, config);
     }
 }
 
@@ -697,12 +735,12 @@ fn log_local_error(
 fn log_upstream_response(
     audit: Option<&AuditLogger>,
     audit_checkpoint_path: Option<&Path>,
+    config: &ProxyConfig,
     id: Option<Value>,
     method: Option<String>,
     tool: Option<String>,
     decision: Option<String>,
     upstream_resp: &Value,
-    config: &ProxyConfig,
 ) {
     let Some(audit) = audit else {
         return;
@@ -732,15 +770,27 @@ fn log_upstream_response(
         };
     }
     if audit.append(event).is_ok() {
-        maybe_write_checkpoint(audit, audit_checkpoint_path);
+        maybe_write_checkpoint_with_signing(audit, audit_checkpoint_path, config);
     }
 }
 
-fn maybe_write_checkpoint(audit: &AuditLogger, audit_checkpoint_path: Option<&Path>) {
+fn maybe_write_checkpoint_with_signing(
+    audit: &AuditLogger,
+    audit_checkpoint_path: Option<&Path>,
+    config: &ProxyConfig,
+) {
     let Some(path) = audit_checkpoint_path else {
         return;
     };
-    if let Ok(cp) = audit.checkpoint() {
+    let Ok(cp) = audit.checkpoint() else {
+        return;
+    };
+    if let Some(key) = &config.audit_signing_key {
+        let Ok(signed) = sign_checkpoint(&cp, key) else {
+            return;
+        };
+        let _ = write_signed_checkpoint_atomic(path, &signed);
+    } else {
         let _ = write_checkpoint(path, &cp);
     }
 }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
+use std::process::ExitCode;
 
-use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -21,6 +21,10 @@ enum Commands {
         approval_store: PathBuf,
         approval_request_id: String,
     },
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -35,6 +39,8 @@ enum ProxyCommands {
         #[arg(long)]
         audit_checkpoint: Option<PathBuf>,
         #[arg(long)]
+        audit_signing_key: Option<PathBuf>,
+        #[arg(long)]
         redact: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         audit_payload_sample_bytes: usize,
@@ -43,8 +49,41 @@ enum ProxyCommands {
     },
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+#[derive(Debug, Subcommand)]
+enum AuditCommands {
+    Keygen {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    Verify {
+        #[arg(long)]
+        audit: PathBuf,
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long)]
+        pubkey: PathBuf,
+    },
+}
+
+fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Commands::Proxy {
             command:
@@ -53,6 +92,7 @@ fn main() -> Result<()> {
                     approval_store,
                     audit,
                     audit_checkpoint,
+                    audit_signing_key,
                     redact,
                     audit_payload_sample_bytes,
                     upstream,
@@ -62,6 +102,7 @@ fn main() -> Result<()> {
             &approval_store,
             audit.as_deref(),
             audit_checkpoint.as_deref(),
+            audit_signing_key.as_deref(),
             redact.as_deref(),
             audit_payload_sample_bytes,
             &upstream,
@@ -74,5 +115,17 @@ fn main() -> Result<()> {
             println!("{token}");
             Ok(())
         }
+        Commands::Audit { command } => match command {
+            AuditCommands::Keygen { out } => {
+                let pubkey = toolfw_core::audit_keygen(&out)?;
+                println!("{pubkey}");
+                Ok(())
+            }
+            AuditCommands::Verify {
+                audit,
+                checkpoint,
+                pubkey,
+            } => toolfw_core::audit_verify(&audit, &checkpoint, &pubkey),
+        },
     }
 }

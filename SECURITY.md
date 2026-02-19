@@ -7,6 +7,7 @@ This MVP is intended to mitigate:
 - unsafe writes by enforcing approval gates for selected tool calls
 - accidental secret leaks via policy deny rules for obvious paths/patterns
 - missing auditability (partial): minimal structured approval state exists now; richer audit logging is planned
+- audit tampering and truncation with hash-chained logs and cryptographically signed checkpoints (when configured)
 
 This MVP does not mitigate:
 - a compromised host operating system
