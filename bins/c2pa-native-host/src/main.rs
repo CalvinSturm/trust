@@ -27,10 +27,15 @@ struct HostRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum Source {
-    Url { url: String },
-    Path { path: String },
+struct Source {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default, rename = "page_url")]
+    _page_url: Option<String>,
+    #[serde(default, rename = "detect_reason")]
+    _detect_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -136,9 +141,14 @@ fn handle_request(
         ..InspectOptions::default()
     };
 
-    let report = match req.source {
-        Source::Path { path } => inspect_from_path(&path, &opts, max_download_bytes),
-        Source::Url { url } => inspect_from_url(&url, &opts, max_download_bytes, timeout_ms),
+    let report = match (req.source.path.as_deref(), req.source.url.as_deref()) {
+        (Some(path), None) => inspect_from_path(path, &opts, max_download_bytes),
+        (None, Some(url)) => inspect_from_url(url, &opts, max_download_bytes, timeout_ms),
+        (Some(_), Some(_)) => Err((
+            "invalid_request",
+            "source must provide only one of path or url".to_string(),
+        )),
+        (None, None) => Err(("invalid_request", "missing source path/url".to_string())),
     }
     .map_err(|(code, msg)| (req.id.clone(), code, msg))?;
 
@@ -224,6 +234,7 @@ fn inspect_from_url(
     report.input.path = url.to_string();
     report.input.size_bytes = total;
     report.input.sha256 = hex::encode(hasher.finalize());
+    apply_strip_heuristics(&mut report, Some(url));
 
     serde_json::to_value(report).map_err(|e| ("inspect_failed", format!("serialize report: {e}")))
 }
@@ -255,5 +266,86 @@ fn truncate_message(s: &str) -> String {
         clean
     } else {
         format!("{}...", &clean[..MAX_ERROR_MSG_LEN])
+    }
+}
+
+fn strip_heuristics(source_url: Option<&str>, creds_present: bool) -> Vec<String> {
+    if creds_present {
+        return Vec::new();
+    }
+    let Some(url) = source_url else {
+        return Vec::new();
+    };
+    let host = extract_host(url);
+    let Some(host) = host else {
+        return Vec::new();
+    };
+    let known = [
+        "x.com",
+        "twitter.com",
+        "twimg.com",
+        "facebook.com",
+        "fbcdn.net",
+        "instagram.com",
+        "cdninstagram.com",
+        "tiktok.com",
+        "tiktokcdn.com",
+        "reddit.com",
+        "redd.it",
+    ];
+    if known
+        .iter()
+        .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+    {
+        return vec![format!(
+            "likely_stripped: No C2PA credentials found. Some platforms strip provenance metadata. Prefer the original file export or source download. (source_host={host})"
+        )];
+    }
+    Vec::new()
+}
+
+fn apply_strip_heuristics(report: &mut c2pa_inspector_core::C2paReport, source_url: Option<&str>) {
+    let extra = strip_heuristics(source_url, report.credentials.present);
+    for w in extra {
+        if !report.validation.warnings.iter().any(|x| x == &w) {
+            report.validation.warnings.push(w);
+        }
+    }
+}
+
+fn extract_host(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let scheme_idx = trimmed.find("://")?;
+    let after = &trimmed[(scheme_idx + 3)..];
+    let host_port = after.split('/').next()?;
+    let host = host_port.split('@').next_back()?;
+    let host = host.split(':').next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heuristics_match_known_hosts_when_missing_creds() {
+        let warnings = strip_heuristics(Some("https://twimg.com/media/x.jpg"), false);
+        assert!(warnings.iter().any(|w| w.starts_with("likely_stripped:")));
+    }
+
+    #[test]
+    fn heuristics_skip_when_creds_present() {
+        let warnings = strip_heuristics(Some("https://twimg.com/media/x.jpg"), true);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn heuristics_skip_unknown_hosts() {
+        let warnings = strip_heuristics(Some("https://example.org/image.jpg"), false);
+        assert!(warnings.is_empty());
     }
 }

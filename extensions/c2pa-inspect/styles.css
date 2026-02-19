@@ -104,3 +104,23 @@ button:hover {
   display: none;
 }
 
+.loadingWrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.spinner {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 3px solid #c4d7df;
+  border-top-color: #0f6f80;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

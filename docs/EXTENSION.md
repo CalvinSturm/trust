@@ -23,6 +23,10 @@ Binary paths:
 3. Click **Load unpacked**
 4. Select `extensions/c2pa-inspect/`
 
+Usage:
+- Right-click an image/link/video: **Inspect Content Credentials**
+- Right-click page background: **Inspect primary media on this page**
+
 ## Native Host Manifest
 
 Template:
@@ -75,6 +79,15 @@ Default value must be the absolute path to the manifest JSON.
 
 Both scripts are idempotent and overwrite the manifest safely.
 
+## Settings
+
+Open extension options page and configure:
+- `trust_mode`: `off` or `default`
+- `max_download_bytes`: 1,000,000 to 200,000,000
+- `timeout_ms`: 1,000 to 30,000
+
+Settings are stored in Chrome sync storage (fallback local storage).
+
 ## Security Notes
 
 - URL fetch only allows `http`/`https`.
@@ -83,3 +96,19 @@ Both scripts are idempotent and overwrite the manifest safely.
 - Host does not execute shell commands.
 - Host does not log raw media bytes.
 
+## Troubleshooting
+
+- **No media detected**:
+  The page may not expose visible `img/video poster/og:image` candidates. Try direct image right-click.
+- **Blob/data URLs unsupported**:
+  Only `http`/`https` media URLs are allowed.
+- **Timed out / too large**:
+  Increase timeout or max download bytes in extension settings.
+
+## Manual Test Checklist
+
+1. Right-click a page image and run **Inspect Content Credentials**.
+2. Right-click page background and run **Inspect primary media on this page**.
+3. Open options page, switch trust mode and caps, repeat inspection and verify behavior changes.
+4. Confirm result page shows loading then report/error and supports Retry.
+5. Confirm missing credentials show a gentle “may be stripped” hint.

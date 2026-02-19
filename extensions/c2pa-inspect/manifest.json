@@ -7,7 +7,8 @@
     "contextMenus",
     "storage",
     "nativeMessaging",
-    "tabs"
+    "tabs",
+    "scripting"
   ],
   "host_permissions": [
     "http://*/*",
@@ -24,12 +25,17 @@
   "action": {
     "default_title": "C2PA Inspect"
   },
+  "options_page": "options.html",
   "web_accessible_resources": [
     {
       "resources": [
         "result.html",
         "result.js",
-        "styles.css"
+        "styles.css",
+        "media_detect.js",
+        "options.html",
+        "options.js",
+        "options.css"
       ],
       "matches": [
         "<all_urls>"
@@ -37,4 +43,3 @@
     }
   ]
 }
-

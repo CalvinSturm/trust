@@ -51,8 +51,8 @@ fn native_host_path_source_protocol_and_validation() {
         &json!({
             "id":"req_unsigned",
             "v":1,
-            "trust":"off",
-            "source":{"path": unsigned.to_string_lossy()}
+            "trust":"default",
+            "source":{"path": unsigned.to_string_lossy(), "page_url":"https://example.org/page", "detect_reason":"largest_img"}
         }),
     )
     .unwrap();

@@ -1,0 +1,48 @@
+body {
+  font-family: "Segoe UI", sans-serif;
+  margin: 24px;
+  background: #f6f7fb;
+  color: #1c2230;
+}
+
+main {
+  max-width: 560px;
+  background: #fff;
+  border: 1px solid #d9dfeb;
+  border-radius: 12px;
+  padding: 18px;
+}
+
+form {
+  display: grid;
+  gap: 12px;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+}
+
+input, select, button {
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid #c9d2e3;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  background: #176f82;
+  color: #fff;
+  border: 0;
+  cursor: pointer;
+}
+
+#status {
+  min-height: 20px;
+  color: #176f82;
+}
+
