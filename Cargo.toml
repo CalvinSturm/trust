@@ -17,7 +17,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/CalvinSturm/trust"
 rust-version = "1.80"
-version = "0.1.0"
+version = "0.2.0"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -43,10 +43,12 @@ tempfile = "3"
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+agent-profiles = { path = "crates/agent-profiles" }
 audit-log = { path = "crates/audit-log" }
 auth-keyring = { path = "crates/auth-keyring" }
 cap-token = { path = "crates/cap-token" }
 native-messaging = { path = "crates/native-messaging" }
+toolfw-core = { path = "crates/toolfw-core" }
 rusqlite.workspace = true
 c2pa.workspace = true
 rcgen = "0.13"
