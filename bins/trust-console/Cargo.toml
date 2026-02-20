@@ -1,0 +1,17 @@
+[package]
+name = "trust-console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+agent-profiles = { path = "../../crates/agent-profiles" }
+clap.workspace = true
+crossterm = "0.28"
+ratatui = "0.29"
+serde.workspace = true
+serde_json.workspace = true
+chrono = { version = "0.4", default-features = true, features = ["clock"] }
+toolfw-core = { path = "../../crates/toolfw-core" }

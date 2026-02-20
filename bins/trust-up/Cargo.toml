@@ -1,0 +1,15 @@
+[package]
+name = "trust-up"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+agent-profiles = { path = "../../crates/agent-profiles" }
+clap.workspace = true
+ctrlc = "3.4"
+serde.workspace = true
+serde_json.workspace = true
+toolfw-core = { path = "../../crates/toolfw-core" }
