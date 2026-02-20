@@ -496,10 +496,7 @@ fn create_run_layout(root: &Path, mode: PolicyMode) -> Result<()> {
     fs::create_dir_all(&paths.audit_dir)?;
 
     fs::write(paths.data_dir.join("hello.txt"), "hello world\n")?;
-    fs::write(
-        paths.data_dir.join(".env"),
-        format!("SECRET={SENTINEL}\n"),
-    )?;
+    fs::write(paths.data_dir.join(".env"), format!("SECRET={SENTINEL}\n"))?;
     fs::write(&paths.audit_path, "")?;
     fs::write(&paths.checkpoint_path, "")?;
 
